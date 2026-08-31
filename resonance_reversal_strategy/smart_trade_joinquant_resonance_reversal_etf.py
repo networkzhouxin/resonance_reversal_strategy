@@ -9,10 +9,12 @@ from numbers import Real
 
 
 STRATEGY_VERSION = "resonance-v0.1.0"
-DEPLOYMENT_BUILD_ID = "20260828.5"
+DEPLOYMENT_BUILD_ID = "20260831.1"
 FORMAL_EVENT_LOGIC_BUILD_ID = "20260827.3"
 ATR_EXIT_POLICY = "OBSERVE_ONLY"
 RELATIVE_BUY_POLICY = "EMPTY_SLOT_BACKFILL"
+NEW_BUY_VOLUME_POLICY = "T1_VOLUME_RATIO_AT_OR_BELOW_ONE"
+NEW_BUY_VOLUME_THRESHOLD = 1.0
 BENCHMARK = "000300.XSHG"
 
 
@@ -20,6 +22,12 @@ class TurnDirection(Enum):
     BUY_TURN = "BUY_TURN"
     SELL_TURN = "SELL_TURN"
     NEUTRAL = "NEUTRAL"
+
+
+class NewBuyVolumeEligibility(Enum):
+    ELIGIBLE = "ELIGIBLE"
+    ABOVE_ONE = "ABOVE_ONE"
+    INVALID_VALUE = "INVALID_VALUE"
 
 
 OPPOSITE = {
@@ -872,6 +880,8 @@ def initialize(context):
         "relative_observation_fingerprint": relative_observation_fingerprint(),
         "atr_exit_policy": ATR_EXIT_POLICY,
         "relative_buy_policy": RELATIVE_BUY_POLICY,
+        "new_buy_volume_policy": NEW_BUY_VOLUME_POLICY,
+        "new_buy_volume_threshold": NEW_BUY_VOLUME_THRESHOLD,
         "etf_pool": list(g.etf_pool),
     })
 
@@ -886,6 +896,58 @@ def is_finite_positive(value):
     except (TypeError, ValueError):
         return False
     return bool(np.isfinite(numeric) and numeric > 0)
+
+
+def _new_buy_volume_value(snapshot):
+    observation_values = snapshot.get("observation_values") or {}
+    value = observation_values.get("volume_ratio")
+    if isinstance(value, bool):
+        return None
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not np.isfinite(numeric) or numeric < 0:
+        return None
+    return numeric
+
+
+def classify_new_buy_volume_eligibility(snapshot):
+    numeric = _new_buy_volume_value(snapshot)
+    if numeric is None:
+        return NewBuyVolumeEligibility.INVALID_VALUE
+    if numeric > NEW_BUY_VOLUME_THRESHOLD:
+        return NewBuyVolumeEligibility.ABOVE_ONE
+    return NewBuyVolumeEligibility.ELIGIBLE
+
+
+def new_buy_volume_rejection_reason(snapshot):
+    eligibility = classify_new_buy_volume_eligibility(snapshot)
+    if eligibility is NewBuyVolumeEligibility.ELIGIBLE:
+        return None
+    if eligibility is NewBuyVolumeEligibility.ABOVE_ONE:
+        return "BUY_VOLUME_RATIO_ABOVE_ONE"
+    return "BUY_VOLUME_RATIO_INVALID"
+
+
+def log_new_buy_volume_eligibility(decision, snapshot):
+    eligibility = classify_new_buy_volume_eligibility(snapshot)
+    runtime = globals().get("g")
+    resonance_id = decision.get("resonance_id") or ""
+    _emit_structured_log("new_buy_volume_eligibility", {
+        "build": DEPLOYMENT_BUILD_ID,
+        "code": decision.get("code"),
+        "decision_date": getattr(runtime, "state_date", None),
+        "signal_date": decision.get("signal_date"),
+        "resonance_id": resonance_id,
+        "entry_source": (
+            "RELATIVE" if resonance_id.startswith("RELATIVE:") else "FORMAL"
+        ),
+        "policy": NEW_BUY_VOLUME_POLICY,
+        "threshold": NEW_BUY_VOLUME_THRESHOLD,
+        "volume_ratio": _new_buy_volume_value(snapshot),
+        "eligibility": eligibility.value,
+    })
 
 
 def load_signal_price_frame(code, prev_date, lookback_days):
@@ -2422,6 +2484,11 @@ def run_signal_buys(
             log_resonance_decision(
                 decision, False, "RESONANCE_ALREADY_PROCESSED",
             )
+            continue
+        log_new_buy_volume_eligibility(decision, snapshots[code])
+        volume_rejection = new_buy_volume_rejection_reason(snapshots[code])
+        if volume_rejection is not None:
+            log_resonance_decision(decision, False, volume_rejection)
             continue
         tradability = get_tradability(current_data, code)
         if tradability is Tradability.PAUSED:

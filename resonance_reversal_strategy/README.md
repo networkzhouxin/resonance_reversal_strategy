@@ -2,7 +2,8 @@
 
 本目录是一套独立的新聚宽策略，未替代、导入或修改仓库中的
 `cross_signal_strategy`、多因子策略、V15 系列或 PTrade 策略。当前版本是首个代码
-里程碑，只用于本地单元验证以及后续聚宽回测验证；它不包含收益结论、实盘授权、
+里程碑。当前代码是从保留基线 `20260828.5` 独立分出的 `20260831.1` 量比买入过滤
+候选，只用于本地单元验证以及后续聚宽回测验证；它不包含候选收益结论、实盘授权、
 PTrade 版本或本地收益回放器。
 
 ## 策略摘要
@@ -33,8 +34,9 @@ PTrade 版本或本地收益回放器。
 
 首版固定参数：日线回看 120 根、RSI14、KDJ(9,3,3)、BOLL(20,2)、ATR14、
 ATR 移动止损倍数 2.5、止损百分比限制 5% 至 15%、最多持有 3 只、总目标仓位
-95%。RSI6/12/24、ADX/+DI/-DI、成交量、量比、BOLL 带宽和中轨斜率仅记录观察，
-不参与交易。K-D 差值由负转正或由正转负形成的正式金叉/死叉也只写入观察日志，
+95%。RSI6/12/24、ADX/+DI/-DI、成交量、BOLL 带宽和中轨斜率仅记录观察，
+不参与交易；量比仅在 `20260831.1` 候选中作为全部新买入的 T-1 资格门槛。
+K-D 差值由负转正或由正转负形成的正式金叉/死叉也只写入观察日志，
 不会替代预交叉拐点或成为交易条件。
 
 ## 数据和执行边界
@@ -83,7 +85,8 @@ buy_target = min(standard_target, max(0, available_cash - cash_reserve))
 4. 训练记录完成后，必须再次取得用户确认，才可以依次打开验证窗口。
 
 禁止使用本地收益替代聚宽结果，禁止用验证期或全周期结果调整参数，禁止删除训练期
-表现较差的 ETF，禁止把观察指标升级为买卖资格、排序、仓位或卖出条件。训练门槛
+表现较差的 ETF。除已单独批准并版本化的 `20260831.1` 量比新买入候选外，禁止把
+观察指标升级为买卖资格、排序、仓位或卖出条件。训练门槛
 未通过时也不得临时搜索相邻参数、延长共振窗口或增加指标来改善曲线。
 
 完整业务规则、测试门槛和失败处理见
@@ -220,3 +223,46 @@ python resonance_reversal_strategy/research/analyze_relative_turn_observations.p
 `relative_buy_policy=EMPTY_SLOT_BACKFILL`；这是固定 build 身份，不是运行时开关。
 相对 BUY 队列在正式信号卖出和买入之前冻结，确保 `FutureDataError` 不会发生在二者之后。
 全部信号仍来自 T-1 及以前完整日线，T 日当前数据只用于可交易性、执行价格和订单提交。
+
+## T-1 量比新买入过滤候选（build 20260831.1）
+
+该候选只在独立候选分支中运行，`main` 上的 `20260828.5` 继续作为保留基线。它保持
+`ATR_EXIT_POLICY=OBSERVE_ONLY` 和 `relative_buy_policy=EMPTY_SLOT_BACKFILL`，唯一
+交易规则变化是：FORMAL 与 RELATIVE 的实际新买入在进入 T 日可交易性和下单检查前，
+必须具有有限、非负且 `<= 1.0` 的 T-1 `volume_ratio`。
+
+量比来自 `end_date=context.previous_date` 的冻结日线快照，不读取 T 日成交量。候选仍按
+原顺序先处理 FORMAL、再处理 RELATIVE；被量比拒绝的决策不消耗持仓槽、当日尝试或
+共振 ID，后续原排序候选可以继续补位。量比不主动卖出现有持仓，也不改变信号、排序、
+仓位、正式退出、ATR 观察或相对观察登记。
+
+初始化日志新增：
+
+```text
+new_buy_volume_policy=T1_VOLUME_RATIO_AT_OR_BELOW_ONE
+new_buy_volume_threshold=1.0
+```
+
+每个真正到达新买入资格检查的决策输出 `new_buy_volume_eligibility`；其中记录 build、
+FORMAL/RELATIVE 来源、T-1 量比、固定阈值和 `ELIGIBLE/ABOVE_ONE/INVALID_VALUE`。
+非法数值安全记录为 `null` 并 fail closed。研究阶段不搜索 0.8、0.9、1.1 或任何其他
+阈值，也不使用验证期。
+
+聚宽依次完成短期冒烟、2019--2021 普通摩擦和双倍摩擦回测后，使用：
+
+```powershell
+python resonance_reversal_strategy/research/analyze_volume_ratio_candidate.py `
+  --baseline-ordinary-log artifacts/joinquant/training-2019-2021/resonance-20260828.5-standard.log `
+  --baseline-double-friction-log artifacts/joinquant/training-2019-2021/resonance-20260828.5-double-friction.log `
+  --candidate-ordinary-log <20260831.1普通摩擦日志> `
+  --candidate-double-friction-log <20260831.1双倍摩擦日志> `
+  --session-calendar <原始joinquant_sessions_2018_2021.json> `
+  --session-calendar-sha256 <预先冻结的sha256> `
+  --output <候选报告路径>
+```
+
+四份日志、manifest 和输出必须是不同物理文件。分析器验证两组日志身份、账本、T-1
+快照、普通/双倍摩擦成交路径、量比资格决策路径、所有实际买入均为 `ELIGIBLE`，并按
+规格中的真实净值、胜率、回撤、交易数量、年度稳定性、利润集中度、期末持仓和摩擦门槛
+给出 `promote`。当前仓库没有原始 Schema V2 manifest；在原始文件及冻结哈希恢复前，
+不能生成正式候选结论。
