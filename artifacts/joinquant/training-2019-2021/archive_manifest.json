@@ -90,6 +90,16 @@
       "source_attachment": "C:\\Users\\C1-CWadmin\\.codex\\attachments\\1ec300d7-7f5c-4988-a38f-49fbd3c321e5\\pasted-text.txt",
       "bytes": 50488834,
       "sha256": "b237ef5c5d10b05e85bea247a31ad4834869c4b09cca781bd104845d2b983e63"
+    },
+    {
+      "file": "resonance-20260831.2-standard.log",
+      "build": "20260831.2",
+      "friction_profile": "standard",
+      "research_status": "retained_candidate_not_promoted_no_double_friction",
+      "classification_basis": "Ordinary-friction training backtest for the volume-ratio soft-priority research candidate; retained for audit, not promoted to baseline, and not advanced to double friction.",
+      "source_attachment": "C:\\Users\\C1-CWadmin\\.codex\\attachments\\991dd46f-3f07-41ad-8f9f-eb344cf63233\\pasted-text.txt",
+      "bytes": 50929023,
+      "sha256": "39632039fbb9b995360dbfd30d6d8d888d71efd42f4431c7aa98fb7cc03f7b32"
     }
   ],
   "excluded_duplicates": [
