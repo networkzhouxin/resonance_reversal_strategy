@@ -9,10 +9,12 @@ from numbers import Real
 
 
 STRATEGY_VERSION = "resonance-v0.1.0"
-DEPLOYMENT_BUILD_ID = "20260828.5"
+DEPLOYMENT_BUILD_ID = "20260831.2"
 FORMAL_EVENT_LOGIC_BUILD_ID = "20260827.3"
 ATR_EXIT_POLICY = "OBSERVE_ONLY"
 RELATIVE_BUY_POLICY = "EMPTY_SLOT_BACKFILL"
+NEW_BUY_VOLUME_POLICY = "T1_VOLUME_RATIO_SOFT_PRIORITY_WITH_FALLBACK"
+NEW_BUY_VOLUME_THRESHOLD = 1.0
 BENCHMARK = "000300.XSHG"
 
 
@@ -20,6 +22,12 @@ class TurnDirection(Enum):
     BUY_TURN = "BUY_TURN"
     SELL_TURN = "SELL_TURN"
     NEUTRAL = "NEUTRAL"
+
+
+class NewBuyVolumePriority(Enum):
+    AT_OR_BELOW_ONE = "AT_OR_BELOW_ONE"
+    ABOVE_ONE_FALLBACK = "ABOVE_ONE_FALLBACK"
+    INVALID_FALLBACK = "INVALID_FALLBACK"
 
 
 OPPOSITE = {
@@ -872,6 +880,8 @@ def initialize(context):
         "relative_observation_fingerprint": relative_observation_fingerprint(),
         "atr_exit_policy": ATR_EXIT_POLICY,
         "relative_buy_policy": RELATIVE_BUY_POLICY,
+        "new_buy_volume_policy": NEW_BUY_VOLUME_POLICY,
+        "new_buy_volume_threshold": NEW_BUY_VOLUME_THRESHOLD,
         "etf_pool": list(g.etf_pool),
     })
 
@@ -886,6 +896,74 @@ def is_finite_positive(value):
     except (TypeError, ValueError):
         return False
     return bool(np.isfinite(numeric) and numeric > 0)
+
+
+def _new_buy_volume_value(snapshot):
+    observation_values = snapshot.get("observation_values") or {}
+    value = observation_values.get("volume_ratio")
+    if isinstance(value, bool):
+        return None
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not np.isfinite(numeric) or numeric < 0:
+        return None
+    return numeric
+
+
+def classify_new_buy_volume_priority(snapshot):
+    numeric = _new_buy_volume_value(snapshot)
+    if numeric is None:
+        return NewBuyVolumePriority.INVALID_FALLBACK
+    if numeric > NEW_BUY_VOLUME_THRESHOLD:
+        return NewBuyVolumePriority.ABOVE_ONE_FALLBACK
+    return NewBuyVolumePriority.AT_OR_BELOW_ONE
+
+
+def prioritize_new_buy_decisions(decisions, snapshots):
+    entries = []
+    for original_rank, decision in enumerate(decisions, start=1):
+        entries.append({
+            "decision": decision,
+            "original_rank": original_rank,
+            "priority": classify_new_buy_volume_priority(
+                snapshots[decision["code"]]
+            ),
+        })
+    preferred = [
+        entry for entry in entries
+        if entry["priority"] is NewBuyVolumePriority.AT_OR_BELOW_ONE
+    ]
+    fallback = [
+        entry for entry in entries
+        if entry["priority"] is not NewBuyVolumePriority.AT_OR_BELOW_ONE
+    ]
+    ordered = preferred + fallback
+    return tuple(
+        dict(entry, priority_rank=priority_rank)
+        for priority_rank, entry in enumerate(ordered, start=1)
+    )
+
+
+def log_new_buy_volume_priority(entry, snapshots, entry_source):
+    decision = entry["decision"]
+    snapshot = snapshots[decision["code"]]
+    runtime = globals().get("g")
+    _emit_structured_log("new_buy_volume_priority", {
+        "build": DEPLOYMENT_BUILD_ID,
+        "code": decision["code"],
+        "decision_date": getattr(runtime, "state_date", None),
+        "signal_date": decision.get("signal_date"),
+        "resonance_id": decision.get("resonance_id"),
+        "entry_source": entry_source,
+        "policy": NEW_BUY_VOLUME_POLICY,
+        "threshold": NEW_BUY_VOLUME_THRESHOLD,
+        "volume_ratio": _new_buy_volume_value(snapshot),
+        "priority": entry["priority"].value,
+        "original_rank": entry["original_rank"],
+        "priority_rank": entry["priority_rank"],
+    })
 
 
 def load_signal_price_frame(code, prev_date, lookback_days):
@@ -2384,15 +2462,29 @@ def run_signal_buys(
         collect_buy_decisions(snapshots, actual_positions)
     )
     relative_decisions = tuple(relative_buy_decisions or ())
-    for rank, decision in enumerate(formal_decisions, start=1):
+    formal_entries = prioritize_new_buy_decisions(
+        formal_decisions, snapshots,
+    )
+    relative_entries = prioritize_new_buy_decisions(
+        relative_decisions, snapshots,
+    )
+    for entry in formal_entries:
+        decision = entry["decision"]
+        log_new_buy_volume_priority(entry, snapshots, "FORMAL")
         log_resonance_decision(
-            decision, True, "BUY_CANDIDATE_SORTED:%s" % rank,
+            decision, True,
+            "BUY_CANDIDATE_SORTED:%s" % entry["priority_rank"],
         )
-    for rank, decision in enumerate(relative_decisions, start=1):
+    for entry in relative_entries:
+        decision = entry["decision"]
+        log_new_buy_volume_priority(entry, snapshots, "RELATIVE")
         log_resonance_decision(
-            decision, True, "RELATIVE_BUY_CANDIDATE_SORTED:%s" % rank,
+            decision, True,
+            "RELATIVE_BUY_CANDIDATE_SORTED:%s" % entry["priority_rank"],
         )
-    sorted_decisions = tuple(formal_decisions) + relative_decisions
+    sorted_decisions = tuple(
+        entry["decision"] for entry in formal_entries + relative_entries
+    )
     remaining_slots = max(
         0, g.params["max_holdings"] - len(actual_positions),
     )

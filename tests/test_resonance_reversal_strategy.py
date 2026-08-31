@@ -1245,7 +1245,7 @@ def test_flat_position_clears_only_its_risk_state(monkeypatch):
 
 
 def resonance_snapshot(code, direction="BUY_TURN", signal_date="2021-01-05",
-                       support_count=2):
+                       support_count=2, volume_ratio=1.0):
     kdj = direction if support_count == 3 else "NEUTRAL"
     book = event_book_for_directions(
         direction, direction, kdj, signal_date,
@@ -1258,7 +1258,10 @@ def resonance_snapshot(code, direction="BUY_TURN", signal_date="2021-01-05",
         "entry_atr": 1.0,
         "event_book": book,
         "trade_values": {"atr14": 1.0},
-        "observation_values": {"rsi6": 20.0},
+        "observation_values": {
+            "rsi6": 20.0,
+            "volume_ratio": volume_ratio,
+        },
     }
 
 
@@ -2314,8 +2317,12 @@ def test_processed_resonance_id_prevents_duplicate_buy_submission(monkeypatch):
 def test_current_quote_does_not_change_frozen_buy_candidate_order(monkeypatch):
     first, second = "159915.XSHE", "510300.XSHG"
     snapshots = {
-        first: resonance_snapshot(first, support_count=3),
-        second: resonance_snapshot(second, support_count=2),
+        first: resonance_snapshot(
+            first, support_count=3, volume_ratio=1.2,
+        ),
+        second: resonance_snapshot(
+            second, support_count=2, volume_ratio=0.8,
+        ),
     }
     observed_orders = []
 
@@ -2337,7 +2344,164 @@ def test_current_quote_does_not_change_frozen_buy_candidate_order(monkeypatch):
         strategy.run_signal_buys(context, current_data, snapshots)
         observed_orders.append(submitted)
 
-    assert observed_orders == [[first, second], [first, second]]
+    assert observed_orders == [[second, first], [second, first]]
+
+
+def test_volume_priority_stably_reorders_each_source_without_filtering_fallback(
+        monkeypatch):
+    formal_above = "159915.XSHE"
+    formal_below = "510300.XSHG"
+    relative_above = "159928.XSHE"
+    relative_below = "513100.XSHG"
+    snapshots = {
+        formal_above: resonance_snapshot(
+            formal_above, support_count=3, volume_ratio=1.2,
+        ),
+        formal_below: resonance_snapshot(
+            formal_below, support_count=2, volume_ratio=0.8,
+        ),
+        relative_above: resonance_snapshot(
+            relative_above, volume_ratio=1.3,
+        ),
+        relative_below: resonance_snapshot(
+            relative_below, volume_ratio=0.7,
+        ),
+    }
+    for code in (relative_above, relative_below):
+        snapshots[code]["event_book"] = strategy.empty_event_book()
+
+    def relative_decision(code):
+        decision = strategy.build_resonance_decision(
+            formal_below, strategy.TurnDirection.BUY_TURN,
+            snapshots[formal_below]["event_book"],
+            snapshots[formal_below]["signal_date"],
+        )
+        decision = dict(decision)
+        decision["code"] = code
+        decision["resonance_id"] = "RELATIVE:%s" % code
+        return decision
+
+    runtime = runtime_state(max_holdings=4)
+    submitted = []
+    monkeypatch.setattr(strategy, "g", runtime, raising=False)
+    monkeypatch.setattr(
+        strategy, "submit_buy",
+        lambda context, code, snapshot, decision: submitted.append(code)
+        or strategy.OrderOutcome.FILLED,
+        raising=False,
+    )
+
+    results = strategy.run_signal_buys(
+        fake_context(),
+        {code: current_record(10.0) for code in snapshots},
+        snapshots,
+        (
+            relative_decision(relative_above),
+            relative_decision(relative_below),
+        ),
+    )
+
+    expected = [
+        formal_below, formal_above, relative_below, relative_above,
+    ]
+    assert submitted == expected
+    assert [code for code, _ in results] == expected
+
+
+def test_volume_priority_includes_exact_natural_boundary():
+    snapshot = resonance_snapshot("510300.XSHG", volume_ratio=1.0)
+
+    assert strategy.classify_new_buy_volume_priority(snapshot) is (
+        strategy.NewBuyVolumePriority.AT_OR_BELOW_ONE
+    )
+
+
+def test_formal_above_one_keeps_priority_over_relative_below_one(
+        monkeypatch):
+    formal_code = "510300.XSHG"
+    relative_code = "159915.XSHE"
+    formal_snapshot = resonance_snapshot(formal_code, volume_ratio=1.2)
+    relative_snapshot = resonance_snapshot(relative_code, volume_ratio=0.8)
+    relative_snapshot["event_book"] = strategy.empty_event_book()
+    relative_decision = strategy.build_resonance_decision(
+        formal_code, strategy.TurnDirection.BUY_TURN,
+        formal_snapshot["event_book"], formal_snapshot["signal_date"],
+    )
+    relative_decision = dict(relative_decision)
+    relative_decision["code"] = relative_code
+    relative_decision["resonance_id"] = "RELATIVE:%s" % relative_code
+    submitted = []
+    monkeypatch.setattr(
+        strategy, "g", runtime_state(max_holdings=1), raising=False,
+    )
+    monkeypatch.setattr(
+        strategy, "submit_buy",
+        lambda context, code, snapshot, decision: submitted.append(code)
+        or strategy.OrderOutcome.FILLED,
+        raising=False,
+    )
+
+    results = strategy.run_signal_buys(
+        fake_context(),
+        {
+            formal_code: current_record(10.0),
+            relative_code: current_record(10.0),
+        },
+        {formal_code: formal_snapshot, relative_code: relative_snapshot},
+        (relative_decision,),
+    )
+
+    assert submitted == [formal_code]
+    assert results == [(formal_code, strategy.OrderOutcome.FILLED)]
+
+
+def test_invalid_volume_is_audited_as_stable_fallback_not_filtered(
+        monkeypatch):
+    invalid_code = "159915.XSHE"
+    above_code = "510300.XSHG"
+    below_code = "513100.XSHG"
+    snapshots = {
+        invalid_code: resonance_snapshot(
+            invalid_code, support_count=3, volume_ratio=None,
+        ),
+        above_code: resonance_snapshot(
+            above_code, support_count=2, volume_ratio=1.2,
+        ),
+        below_code: resonance_snapshot(
+            below_code, support_count=2, volume_ratio=0.8,
+        ),
+    }
+    submitted = []
+    audit_events = []
+    monkeypatch.setattr(
+        strategy, "g", runtime_state(max_holdings=3), raising=False,
+    )
+    monkeypatch.setattr(
+        strategy, "submit_buy",
+        lambda context, code, snapshot, decision: submitted.append(code)
+        or strategy.OrderOutcome.FILLED,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        strategy, "_emit_structured_log",
+        lambda event, payload: audit_events.append((event, payload)),
+    )
+
+    strategy.run_signal_buys(
+        fake_context(),
+        {code: current_record(10.0) for code in snapshots},
+        snapshots,
+    )
+
+    assert submitted == [below_code, invalid_code, above_code]
+    audits = [
+        payload for event, payload in audit_events
+        if event == "new_buy_volume_priority"
+    ]
+    assert [payload["priority"] for payload in audits] == [
+        "AT_OR_BELOW_ONE", "INVALID_FALLBACK", "ABOVE_ONE_FALLBACK",
+    ]
+    assert [payload["priority_rank"] for payload in audits] == [1, 2, 3]
 
 
 def test_decision_payload_cannot_receive_observation_fields():
@@ -3040,9 +3204,13 @@ def test_initialize_emits_version_and_separate_configuration_fingerprints(
     payload = json.loads(messages[-1])
     assert payload["event"] == "strategy_initialized"
     assert payload["version"] == strategy.STRATEGY_VERSION
-    assert payload["build"] == "20260828.5"
+    assert payload["build"] == "20260831.2"
     assert payload["atr_exit_policy"] == "OBSERVE_ONLY"
     assert payload["relative_buy_policy"] == "EMPTY_SLOT_BACKFILL"
+    assert payload["new_buy_volume_policy"] == (
+        "T1_VOLUME_RATIO_SOFT_PRIORITY_WITH_FALLBACK"
+    )
+    assert payload["new_buy_volume_threshold"] == 1.0
     assert payload["parameter_fingerprint"]
     assert payload["pool_fingerprint"]
 
@@ -3590,8 +3758,8 @@ def _event_diagnostic_frame(previous_overrides=None, current_overrides=None):
     )
 
 
-def test_diagnostic_build_id_is_bumped():
-    assert strategy.DEPLOYMENT_BUILD_ID == "20260828.5"
+def test_soft_volume_priority_candidate_has_separate_build_id():
+    assert strategy.DEPLOYMENT_BUILD_ID == "20260831.2"
 
 
 def test_relative_observation_build_and_formal_fingerprints_are_separated(
@@ -3603,10 +3771,14 @@ def test_relative_observation_build_and_formal_fingerprints_are_separated(
     strategy.initialize(types.SimpleNamespace())
 
     payload = json.loads(messages[-1])
-    assert strategy.DEPLOYMENT_BUILD_ID == "20260828.5"
-    assert payload["build"] == "20260828.5"
+    assert strategy.DEPLOYMENT_BUILD_ID == "20260831.2"
+    assert payload["build"] == "20260831.2"
     assert payload["atr_exit_policy"] == "OBSERVE_ONLY"
     assert payload["relative_buy_policy"] == "EMPTY_SLOT_BACKFILL"
+    assert payload["new_buy_volume_policy"] == (
+        "T1_VOLUME_RATIO_SOFT_PRIORITY_WITH_FALLBACK"
+    )
+    assert payload["new_buy_volume_threshold"] == 1.0
     assert payload["parameter_fingerprint"] == "e1227fbd8b4a884e"
     assert payload["pool_fingerprint"] == "9123995edeb1ed84"
     assert payload["event_logic_fingerprint"] == "1c0b8a22f48c97c3"
