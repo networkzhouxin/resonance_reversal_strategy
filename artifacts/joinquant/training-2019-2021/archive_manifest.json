@@ -1,0 +1,103 @@
+{
+  "schema_version": 1,
+  "archive_date": "2026-08-31",
+  "strategy": "resonance_reversal",
+  "platform": "JoinQuant",
+  "training_period": {
+    "start": "2019-01-01",
+    "end": "2021-12-31"
+  },
+  "scope": "Raw user-provided JoinQuant backtest logs and the recovered frozen Schema V2 session calendar manifest are archived byte-for-byte; no strategy evaluation or rule change is represented by this manifest.",
+  "calendar_manifest": {
+    "file": "joinquant_sessions_2018_2021.json",
+    "schema_version": 2,
+    "market": "XSHG",
+    "calendar_coverage_start": "2018-01-01",
+    "calendar_coverage_end": "2021-12-31",
+    "evaluation_start": "2019-01-01",
+    "evaluation_end": "2021-12-31",
+    "source": "JoinQuant get_all_trade_days",
+    "session_count": 973,
+    "first_session": "2018-01-02",
+    "last_session": "2021-12-31",
+    "source_attachment": "C:\\Users\\C1-CWadmin\\.codex\\attachments\\9d411391-11d0-417a-bc8c-4c14c93d7142\\pasted-text.txt",
+    "transport": "base64 chunks MANIFEST_B64_0000 through MANIFEST_B64_0034",
+    "bytes": 12877,
+    "sha256": "24cfbdb7cfcac61c1e8a6f58bbdf54f851031ad63a7feb2ac331590ab7ede87f"
+  },
+  "files": [
+    {
+      "file": "resonance-20260827.3-standard.log",
+      "build": "20260827.3",
+      "friction_profile": "standard",
+      "source_attachment": "C:\\Users\\C1-CWadmin\\.codex\\attachments\\74d23d3f-36e2-4175-acee-14615881aae1\\pasted-text.txt",
+      "bytes": 27768714,
+      "sha256": "7ba94d973e66cb142c27814787606e7309f64d45587e4297b5f35668392c3a8b"
+    },
+    {
+      "file": "resonance-20260827.4-standard.log",
+      "build": "20260827.4",
+      "friction_profile": "standard",
+      "source_attachment": "C:\\Users\\C1-CWadmin\\.codex\\attachments\\05a4c904-cb81-4b4b-a1ae-28dd075808b2\\pasted-text.txt",
+      "bytes": 49499975,
+      "sha256": "87b34ca2fae5fc81b9d173d6c1048873ff505f634d3f4f2f277e4516965a5852"
+    },
+    {
+      "file": "resonance-20260828.1-standard.log",
+      "build": "20260828.1",
+      "friction_profile": "standard",
+      "source_attachment": "C:\\Users\\C1-CWadmin\\.codex\\attachments\\8d5e5faf-6d1d-4315-a422-b753a67de1c7\\pasted-text.txt",
+      "bytes": 49568934,
+      "sha256": "987c3d34c280f8a54b93516457f2f562483ee9a626f41bc2cac936aeb9b78278"
+    },
+    {
+      "file": "resonance-20260828.2-standard.log",
+      "build": "20260828.2",
+      "friction_profile": "standard",
+      "source_attachment": "C:\\Users\\C1-CWadmin\\.codex\\attachments\\d981fa25-f046-447f-b464-436b0d2d1ff5\\pasted-text.txt",
+      "bytes": 49821127,
+      "sha256": "0c26db696fd3d5d59143a3c38e1f7896ff3851f4fabe9cbaeb8094d39b3ab3c3"
+    },
+    {
+      "file": "resonance-20260828.3-standard.log",
+      "build": "20260828.3",
+      "friction_profile": "standard",
+      "source_attachment": "C:\\Users\\C1-CWadmin\\.codex\\attachments\\9c0533a3-49ce-461a-863f-285bf97f7204\\pasted-text.txt",
+      "bytes": 49586816,
+      "sha256": "9f814f823dc32e5e415512ea7f3a7fb80c6e4d5907763bfb74fd9be780c0142b"
+    },
+    {
+      "file": "resonance-20260828.4-standard.log",
+      "build": "20260828.4",
+      "friction_profile": "standard",
+      "source_attachment": "C:\\Users\\C1-CWadmin\\.codex\\attachments\\33c03840-518b-4e42-b8ed-e955e3a5c09c\\pasted-text.txt",
+      "bytes": 49656890,
+      "sha256": "dc6bcfafb4ec05fa6dc79f0cac9b71dfcca9f0babb88baa9ba129c2243d3faba"
+    },
+    {
+      "file": "resonance-20260828.5-standard.log",
+      "build": "20260828.5",
+      "friction_profile": "standard",
+      "source_attachment": "C:\\Users\\C1-CWadmin\\.codex\\attachments\\e174359d-7a99-40b6-8125-58c482212c7d\\pasted-text.txt",
+      "bytes": 50487161,
+      "sha256": "07507c5ff24117f9467577bf4f76787637264017be2d1246bcbe7550869128c5"
+    },
+    {
+      "file": "resonance-20260828.5-double-friction.log",
+      "build": "20260828.5",
+      "friction_profile": "double",
+      "classification_basis": "The user explicitly identified this attachment as the double-friction backtest log.",
+      "source_attachment": "C:\\Users\\C1-CWadmin\\.codex\\attachments\\1ec300d7-7f5c-4988-a38f-49fbd3c321e5\\pasted-text.txt",
+      "bytes": 50488834,
+      "sha256": "b237ef5c5d10b05e85bea247a31ad4834869c4b09cca781bd104845d2b983e63"
+    }
+  ],
+  "excluded_duplicates": [
+    {
+      "source_attachment": "C:\\Users\\C1-CWadmin\\.codex\\attachments\\c9fbef6f-f6c2-41d8-8ff3-b1fcd57093ee\\pasted-text.txt",
+      "duplicate_of": "resonance-20260828.2-standard.log",
+      "bytes": 49821127,
+      "sha256": "0c26db696fd3d5d59143a3c38e1f7896ff3851f4fabe9cbaeb8094d39b3ab3c3"
+    }
+  ]
+}
