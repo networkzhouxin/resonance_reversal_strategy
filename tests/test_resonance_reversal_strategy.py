@@ -1925,7 +1925,7 @@ def test_pending_retry_code_cannot_receive_second_signal_sell(monkeypatch):
     assert attempted == set()
 
 
-def test_boll_kdj_only_sell_starts_confirmation_without_order(monkeypatch):
+def test_boll_kdj_only_sell_is_not_delayed(monkeypatch):
     code = "510300.XSHG"
     state = strategy.make_position_state(date(2021, 1, 4), 1.0, 10.0)
     runtime = runtime_state(position_states={code: state})
@@ -1933,60 +1933,7 @@ def test_boll_kdj_only_sell_starts_confirmation_without_order(monkeypatch):
         previous_date=date(2021, 1, 5), current_date=date(2021, 1, 6),
         positions={code: fake_position(100)},
     )
-    decision_logs = []
-    audit_events = []
-    monkeypatch.setattr(strategy, "g", runtime, raising=False)
-    monkeypatch.setattr(
-        strategy, "submit_sell",
-        lambda *args: pytest.fail("first BOLL+KDJ sell must only register"),
-        raising=False,
-    )
-    monkeypatch.setattr(
-        strategy, "log_resonance_decision",
-        lambda decision, accepted, reason: decision_logs.append(
-            (accepted, reason)
-        ),
-        raising=False,
-    )
-    monkeypatch.setattr(
-        strategy, "_emit_structured_log",
-        lambda event, payload: audit_events.append((event, payload)),
-        raising=False,
-    )
-
-    attempted = strategy.run_signal_exits(
-        context, {code: current_record()},
-        {code: boll_kdj_sell_snapshot(code)},
-    )
-
-    assert attempted == set()
-    assert runtime.processed_resonance_ids == {}
-    confirmation = state["signal_exit_confirmation"]
-    assert confirmation["created_date"] == date(2021, 1, 6)
-    assert confirmation["signal_date"] == date(2021, 1, 5)
-    assert confirmation["supporters"] == ("BOLL", "KDJ")
-    assert (False, "SIGNAL_EXIT_CONFIRMATION_STARTED") in decision_logs
-    assert audit_events[-1][0] == "signal_exit_confirmation"
-    assert audit_events[-1][1]["action"] == "STARTED"
-
-
-def test_due_boll_kdj_confirmation_sells_when_formal_sell_persists(
-        monkeypatch):
-    code = "510300.XSHG"
-    state = strategy.make_position_state(date(2021, 1, 4), 1.0, 10.0)
-    state["signal_exit_confirmation"] = {
-        "created_date": date(2021, 1, 6),
-        "signal_date": date(2021, 1, 5),
-        "resonance_id": "first-sell",
-        "supporters": ("BOLL", "KDJ"),
-    }
-    runtime = runtime_state(position_states={code: state})
-    context = fake_context(
-        previous_date=date(2021, 1, 6), current_date=date(2021, 1, 7),
-        positions={code: fake_position(100)},
-    )
     sell_calls = []
-    audit_events = []
     monkeypatch.setattr(strategy, "g", runtime, raising=False)
     monkeypatch.setattr(
         strategy, "submit_sell",
@@ -1995,102 +1942,15 @@ def test_due_boll_kdj_confirmation_sells_when_formal_sell_persists(
         or strategy.OrderOutcome.FILLED,
         raising=False,
     )
-    monkeypatch.setattr(
-        strategy, "_emit_structured_log",
-        lambda event, payload: audit_events.append((event, payload)),
-        raising=False,
-    )
-
-    attempted = strategy.run_signal_exits(
-        context, {code: current_record()},
-        {code: boll_kdj_sell_snapshot(code, signal_date="2021-01-06")},
-    )
-
-    assert attempted == {code}
-    assert sell_calls == [(code, strategy.ExitReason.SIGNAL_EXIT, 10.0)]
-    assert state["signal_exit_confirmation"] is None
-    assert len(runtime.processed_resonance_ids) == 1
-    assert any(
-        event == "signal_exit_confirmation"
-        and payload["action"] == "CONFIRMED"
-        for event, payload in audit_events
-    )
-
-
-def test_due_boll_kdj_confirmation_clears_when_formal_sell_disappears(
-        monkeypatch):
-    code = "510300.XSHG"
-    state = strategy.make_position_state(date(2021, 1, 4), 1.0, 10.0)
-    state["signal_exit_confirmation"] = {
-        "created_date": date(2021, 1, 6),
-        "signal_date": date(2021, 1, 5),
-        "resonance_id": "first-sell",
-        "supporters": ("BOLL", "KDJ"),
-    }
-    runtime = runtime_state(position_states={code: state})
-    context = fake_context(
-        previous_date=date(2021, 1, 6), current_date=date(2021, 1, 7),
-        positions={code: fake_position(100)},
-    )
-    snapshot = resonance_snapshot(code, signal_date="2021-01-06")
-    snapshot["event_book"] = strategy.empty_event_book()
-    audit_events = []
-    monkeypatch.setattr(strategy, "g", runtime, raising=False)
-    monkeypatch.setattr(
-        strategy, "submit_sell",
-        lambda *args: pytest.fail("disappeared sell must cancel confirmation"),
-        raising=False,
-    )
-    monkeypatch.setattr(
-        strategy, "_emit_structured_log",
-        lambda event, payload: audit_events.append((event, payload)),
-        raising=False,
-    )
-
-    attempted = strategy.run_signal_exits(
-        context, {code: current_record()}, {code: snapshot},
-    )
-
-    assert attempted == set()
-    assert state["signal_exit_confirmation"] is None
-    assert runtime.processed_resonance_ids == {}
-    assert any(
-        event == "signal_exit_confirmation"
-        and payload["action"] == "CANCELLED_NO_COMPLETE_SELL"
-        for event, payload in audit_events
-    )
-
-
-def test_boll_kdj_confirmation_cannot_confirm_on_created_date(monkeypatch):
-    code = "510300.XSHG"
-    state = strategy.make_position_state(date(2021, 1, 4), 1.0, 10.0)
-    confirmation = {
-        "created_date": date(2021, 1, 6),
-        "signal_date": date(2021, 1, 5),
-        "resonance_id": "first-sell",
-        "supporters": ("BOLL", "KDJ"),
-    }
-    state["signal_exit_confirmation"] = confirmation
-    runtime = runtime_state(position_states={code: state})
-    context = fake_context(
-        previous_date=date(2021, 1, 5), current_date=date(2021, 1, 6),
-        positions={code: fake_position(100)},
-    )
-    monkeypatch.setattr(strategy, "g", runtime, raising=False)
-    monkeypatch.setattr(
-        strategy, "submit_sell",
-        lambda *args: pytest.fail("same-day call is not next-session confirmation"),
-        raising=False,
-    )
 
     attempted = strategy.run_signal_exits(
         context, {code: current_record()},
         {code: boll_kdj_sell_snapshot(code)},
     )
 
-    assert attempted == set()
-    assert state["signal_exit_confirmation"] is confirmation
-    assert runtime.processed_resonance_ids == {}
+    assert attempted == {code}
+    assert sell_calls == [(code, strategy.ExitReason.SIGNAL_EXIT, 10.0)]
+    assert len(runtime.processed_resonance_ids) == 1
 
 
 def test_paused_signal_exit_freezes_pending_and_retries_first_next_session(
@@ -3382,16 +3242,13 @@ def test_initialize_emits_version_and_separate_configuration_fingerprints(
     payload = json.loads(messages[-1])
     assert payload["event"] == "strategy_initialized"
     assert payload["version"] == strategy.STRATEGY_VERSION
-    assert payload["build"] == "20260901.1"
+    assert payload["build"] == "20260831.2"
     assert payload["atr_exit_policy"] == "OBSERVE_ONLY"
     assert payload["relative_buy_policy"] == "EMPTY_SLOT_BACKFILL"
     assert payload["new_buy_volume_policy"] == (
         "T1_VOLUME_RATIO_SOFT_PRIORITY_WITH_FALLBACK"
     )
     assert payload["new_buy_volume_threshold"] == 1.0
-    assert payload["formal_sell_confirmation_policy"] == (
-        "BOLL_KDJ_ONLY_NEXT_SESSION_CONFIRMATION"
-    )
     assert payload["parameter_fingerprint"]
     assert payload["pool_fingerprint"]
 
@@ -3940,7 +3797,7 @@ def _event_diagnostic_frame(previous_overrides=None, current_overrides=None):
 
 
 def test_soft_volume_priority_candidate_has_separate_build_id():
-    assert strategy.DEPLOYMENT_BUILD_ID == "20260901.1"
+    assert strategy.DEPLOYMENT_BUILD_ID == "20260831.2"
 
 
 def test_relative_observation_build_and_formal_fingerprints_are_separated(
@@ -3952,17 +3809,14 @@ def test_relative_observation_build_and_formal_fingerprints_are_separated(
     strategy.initialize(types.SimpleNamespace())
 
     payload = json.loads(messages[-1])
-    assert strategy.DEPLOYMENT_BUILD_ID == "20260901.1"
-    assert payload["build"] == "20260901.1"
+    assert strategy.DEPLOYMENT_BUILD_ID == "20260831.2"
+    assert payload["build"] == "20260831.2"
     assert payload["atr_exit_policy"] == "OBSERVE_ONLY"
     assert payload["relative_buy_policy"] == "EMPTY_SLOT_BACKFILL"
     assert payload["new_buy_volume_policy"] == (
         "T1_VOLUME_RATIO_SOFT_PRIORITY_WITH_FALLBACK"
     )
     assert payload["new_buy_volume_threshold"] == 1.0
-    assert payload["formal_sell_confirmation_policy"] == (
-        "BOLL_KDJ_ONLY_NEXT_SESSION_CONFIRMATION"
-    )
     assert payload["parameter_fingerprint"] == "e1227fbd8b4a884e"
     assert payload["pool_fingerprint"] == "9123995edeb1ed84"
     assert payload["event_logic_fingerprint"] == "1c0b8a22f48c97c3"

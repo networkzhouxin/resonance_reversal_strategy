@@ -100,6 +100,16 @@
       "source_attachment": "C:\\Users\\C1-CWadmin\\.codex\\attachments\\991dd46f-3f07-41ad-8f9f-eb344cf63233\\pasted-text.txt",
       "bytes": 50929023,
       "sha256": "39632039fbb9b995360dbfd30d6d8d888d71efd42f4431c7aa98fb7cc03f7b32"
+    },
+    {
+      "file": "resonance-20260901.1-standard.log",
+      "build": "20260901.1",
+      "friction_profile": "standard",
+      "research_status": "rejected_candidate_ordinary_prescreen_failed_no_double_friction",
+      "classification_basis": "Ordinary-friction training backtest for the BOLL+KDJ-only next-session sell-confirmation candidate; rejected because real-path return, win rate, drawdown, trade count, annual stability, profit concentration, and worst-trade gates failed, so it was not advanced to double friction.",
+      "source_attachment": "C:\\Users\\C1-CWadmin\\.codex\\attachments\\11a72d81-4d8a-4ecb-9ebc-66ec5bc59171\\pasted-text.txt",
+      "bytes": 51081122,
+      "sha256": "86bff6733dc9ba5b0c588215a6ac04668a8474243bdbb32701d51c96bfc8ed4f"
     }
   ],
   "excluded_duplicates": [
