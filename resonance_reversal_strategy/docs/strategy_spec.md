@@ -629,3 +629,15 @@ relative observation stage
 
 信号快照、正式和相对事件都只读取 T-1 及以前完整日线。T 日 09:35 当前数据只用于可
 交易性、执行价格和订单提交，不得回写相对事件、排序、持仓槽资格或卖出判断。
+
+## RELATIVE BUY BOLL 中轨斜率过滤候选（build 20260901.3）
+
+本候选以 `adcb020`/`20260828.5` 为直接基线。唯一允许变化是：相对 BUY 在稳定排序与
+空位消耗前，必须满足冻结 T-1 快照中的 `boll_mid_slope / close >= 0.0`。负值拒绝；
+斜率或收盘价无效时 fail-closed 拒绝。FORMAL BUY 不使用该资格条件。
+
+该条件不改变正式优先、相对排序键、持仓、卖出、仓位、订单状态、ETF 池或 ATR
+`OBSERVE_ONLY`。不得使用 T 日字段修改资格，不得搜索其他阈值，也不得与量比或其他
+候选组合。普通摩擦真实路径未同时通过收益、胜率、Wilson 下界、回撤、交易数量、年度
+稳定性、利润集中度、期末未平仓、最差交易和资金利用率门槛时，候选直接拒绝。完整合同见
+[`2026-09-01-relative-boll-slope-filter-candidate-design.md`](superpowers/specs/2026-09-01-relative-boll-slope-filter-candidate-design.md)。

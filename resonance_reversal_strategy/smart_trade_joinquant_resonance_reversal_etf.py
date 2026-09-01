@@ -9,10 +9,14 @@ from numbers import Real
 
 
 STRATEGY_VERSION = "resonance-v0.1.0"
-DEPLOYMENT_BUILD_ID = "20260828.5"
+DEPLOYMENT_BUILD_ID = "20260901.3"
 FORMAL_EVENT_LOGIC_BUILD_ID = "20260827.3"
 ATR_EXIT_POLICY = "OBSERVE_ONLY"
 RELATIVE_BUY_POLICY = "EMPTY_SLOT_BACKFILL"
+RELATIVE_BUY_BOLL_SLOPE_POLICY = (
+    "T1_NORMALIZED_BOLL_MID_SLOPE_NONNEGATIVE"
+)
+RELATIVE_BUY_BOLL_SLOPE_THRESHOLD = 0.0
 BENCHMARK = "000300.XSHG"
 
 
@@ -872,6 +876,10 @@ def initialize(context):
         "relative_observation_fingerprint": relative_observation_fingerprint(),
         "atr_exit_policy": ATR_EXIT_POLICY,
         "relative_buy_policy": RELATIVE_BUY_POLICY,
+        "relative_buy_boll_slope_policy": RELATIVE_BUY_BOLL_SLOPE_POLICY,
+        "relative_buy_boll_slope_threshold": (
+            RELATIVE_BUY_BOLL_SLOPE_THRESHOLD
+        ),
         "etf_pool": list(g.etf_pool),
     })
 
@@ -2104,6 +2112,23 @@ def make_relative_buy_decision(observation):
     }
 
 
+def normalized_boll_mid_slope(snapshot):
+    if not is_finite_positive(snapshot.get("close")):
+        return None
+    observation_values = snapshot.get("observation_values")
+    if not isinstance(observation_values, dict):
+        return None
+    try:
+        slope = float(observation_values.get("boll_mid_slope"))
+        close = float(snapshot.get("close"))
+    except (TypeError, ValueError):
+        return None
+    normalized = slope / close
+    if not np.isfinite(normalized):
+        return None
+    return normalized
+
+
 def collect_relative_buy_decisions(snapshots):
     decisions = []
     for observation in collect_relative_resonance_observations(snapshots):
@@ -2114,6 +2139,17 @@ def collect_relative_buy_decisions(snapshots):
         if not is_finite_positive(snapshots[code].get("entry_atr")):
             log_resonance_decision(
                 decision, False, "RELATIVE_BUY_INVALID_ENTRY_ATR",
+            )
+            continue
+        boll_slope = normalized_boll_mid_slope(snapshots[code])
+        if boll_slope is None:
+            log_resonance_decision(
+                decision, False, "RELATIVE_BUY_BOLL_SLOPE_INVALID",
+            )
+            continue
+        if boll_slope < RELATIVE_BUY_BOLL_SLOPE_THRESHOLD:
+            log_resonance_decision(
+                decision, False, "RELATIVE_BUY_BOLL_SLOPE_NEGATIVE",
             )
             continue
         decisions.append(decision)

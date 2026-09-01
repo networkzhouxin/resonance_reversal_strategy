@@ -220,3 +220,15 @@ python resonance_reversal_strategy/research/analyze_relative_turn_observations.p
 `relative_buy_policy=EMPTY_SLOT_BACKFILL`；这是固定 build 身份，不是运行时开关。
 相对 BUY 队列在正式信号卖出和买入之前冻结，确保 `FutureDataError` 不会发生在二者之后。
 全部信号仍来自 T-1 及以前完整日线，T 日当前数据只用于可交易性、执行价格和订单提交。
+
+## RELATIVE BUY BOLL 中轨斜率过滤候选（build 20260901.3）
+
+该候选直接从保留基线 `20260828.5` 分出，只在相对 BUY 排序和空位消耗之前增加一项
+T-1 资格条件：`boll_mid_slope / close >= 0.0`。负值候选被拒绝；斜率或 T-1 收盘价
+缺失、非有限或无效时 fail-closed 拒绝。阈值固定为 `0.0`，不搜索其他阈值。
+
+FORMAL BUY、相对候选排序键、空位补位机制、已有持仓、卖出、仓位、ETF 池、订单状态
+以及 `ATR_EXIT_POLICY="OBSERVE_ONLY"` 均不变。本地测试只冻结代码合同；候选是否改善
+策略必须由 2019--2021 普通摩擦聚宽完整回测决定。普通摩擦未通过即拒绝，不组合量比、
+不搜索阈值、不进入双倍摩擦。完整边界和验收门槛见
+[`2026-09-01-relative-boll-slope-filter-candidate-design.md`](docs/superpowers/specs/2026-09-01-relative-boll-slope-filter-candidate-design.md)。

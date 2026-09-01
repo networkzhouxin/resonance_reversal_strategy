@@ -1245,7 +1245,7 @@ def test_flat_position_clears_only_its_risk_state(monkeypatch):
 
 
 def resonance_snapshot(code, direction="BUY_TURN", signal_date="2021-01-05",
-                       support_count=2):
+                       support_count=2, boll_mid_slope=0.1):
     kdj = direction if support_count == 3 else "NEUTRAL"
     book = event_book_for_directions(
         direction, direction, kdj, signal_date,
@@ -1258,8 +1258,22 @@ def resonance_snapshot(code, direction="BUY_TURN", signal_date="2021-01-05",
         "entry_atr": 1.0,
         "event_book": book,
         "trade_values": {"atr14": 1.0},
-        "observation_values": {"rsi6": 20.0},
+        "observation_values": {
+            "rsi6": 20.0,
+            "boll_mid_slope": boll_mid_slope,
+        },
     }
+
+
+def relative_buy_snapshot(code, boll_mid_slope=0.1):
+    snapshot = resonance_snapshot(
+        code, boll_mid_slope=boll_mid_slope,
+    )
+    snapshot["event_book"] = strategy.empty_event_book()
+    snapshot["relative_event_book"] = relative_event_book_for_directions(
+        "BUY_TURN", "BUY_TURN", "BUY_TURN", "2021-01-05",
+    )
+    return snapshot
 
 
 def runtime_state(max_holdings=3, position_states=None, processed=None,
@@ -3040,9 +3054,13 @@ def test_initialize_emits_version_and_separate_configuration_fingerprints(
     payload = json.loads(messages[-1])
     assert payload["event"] == "strategy_initialized"
     assert payload["version"] == strategy.STRATEGY_VERSION
-    assert payload["build"] == "20260828.5"
+    assert payload["build"] == "20260901.3"
     assert payload["atr_exit_policy"] == "OBSERVE_ONLY"
     assert payload["relative_buy_policy"] == "EMPTY_SLOT_BACKFILL"
+    assert payload["relative_buy_boll_slope_policy"] == (
+        "T1_NORMALIZED_BOLL_MID_SLOPE_NONNEGATIVE"
+    )
+    assert payload["relative_buy_boll_slope_threshold"] == 0.0
     assert payload["parameter_fingerprint"]
     assert payload["pool_fingerprint"]
 
@@ -3591,7 +3609,7 @@ def _event_diagnostic_frame(previous_overrides=None, current_overrides=None):
 
 
 def test_diagnostic_build_id_is_bumped():
-    assert strategy.DEPLOYMENT_BUILD_ID == "20260828.5"
+    assert strategy.DEPLOYMENT_BUILD_ID == "20260901.3"
 
 
 def test_relative_observation_build_and_formal_fingerprints_are_separated(
@@ -3603,10 +3621,14 @@ def test_relative_observation_build_and_formal_fingerprints_are_separated(
     strategy.initialize(types.SimpleNamespace())
 
     payload = json.loads(messages[-1])
-    assert strategy.DEPLOYMENT_BUILD_ID == "20260828.5"
-    assert payload["build"] == "20260828.5"
+    assert strategy.DEPLOYMENT_BUILD_ID == "20260901.3"
+    assert payload["build"] == "20260901.3"
     assert payload["atr_exit_policy"] == "OBSERVE_ONLY"
     assert payload["relative_buy_policy"] == "EMPTY_SLOT_BACKFILL"
+    assert payload["relative_buy_boll_slope_policy"] == (
+        "T1_NORMALIZED_BOLL_MID_SLOPE_NONNEGATIVE"
+    )
+    assert payload["relative_buy_boll_slope_threshold"] == 0.0
     assert payload["parameter_fingerprint"] == "e1227fbd8b4a884e"
     assert payload["pool_fingerprint"] == "9123995edeb1ed84"
     assert payload["event_logic_fingerprint"] == "1c0b8a22f48c97c3"
@@ -4053,6 +4075,119 @@ def test_relative_buy_backfills_only_after_formal_buy(monkeypatch):
         (formal_code, strategy.OrderOutcome.FILLED),
         (relative_code, strategy.OrderOutcome.FILLED),
     ]
+
+
+def test_relative_buy_boll_slope_filter_accepts_zero_and_positive_only(
+        monkeypatch):
+    negative_code = "510300.XSHG"
+    zero_code = "159915.XSHE"
+    positive_code = "513100.XSHG"
+    snapshots = {
+        negative_code: relative_buy_snapshot(negative_code, -0.01),
+        zero_code: relative_buy_snapshot(zero_code, 0.0),
+        positive_code: relative_buy_snapshot(positive_code, 0.02),
+    }
+    reasons = []
+    monkeypatch.setattr(
+        strategy, "log_resonance_decision",
+        lambda decision, accepted, reason: reasons.append(
+            (decision["code"], accepted, reason)
+        ),
+        raising=False,
+    )
+
+    decisions = strategy.prepare_relative_buy_decisions(snapshots)
+
+    assert [decision["code"] for decision in decisions] == [
+        zero_code, positive_code,
+    ]
+    assert reasons == [(
+        negative_code, False, "RELATIVE_BUY_BOLL_SLOPE_NEGATIVE",
+    )]
+
+
+def test_relative_buy_boll_slope_is_normalized_by_t_minus_one_close():
+    snapshot = relative_buy_snapshot("510300.XSHG", 0.2)
+    snapshot["close"] = 10.0
+
+    assert strategy.normalized_boll_mid_slope(snapshot) == pytest.approx(0.02)
+
+
+@pytest.mark.parametrize(
+    "invalid_slope,remove_slope,invalid_close",
+    [
+        (None, False, None),
+        (float("nan"), False, None),
+        (float("inf"), False, None),
+        (0.1, True, None),
+        (0.1, False, 0.0),
+    ],
+)
+def test_relative_buy_boll_slope_filter_fails_closed_for_invalid_input(
+        monkeypatch, invalid_slope, remove_slope, invalid_close):
+    code = "510300.XSHG"
+    snapshot = relative_buy_snapshot(code, invalid_slope)
+    if remove_slope:
+        snapshot["observation_values"].pop("boll_mid_slope")
+    if invalid_close is not None:
+        snapshot["close"] = invalid_close
+    reasons = []
+    monkeypatch.setattr(
+        strategy, "log_resonance_decision",
+        lambda decision, accepted, reason: reasons.append(
+            (decision["code"], accepted, reason)
+        ),
+        raising=False,
+    )
+
+    assert strategy.prepare_relative_buy_decisions({code: snapshot}) == ()
+    assert reasons == [(
+        code, False, "RELATIVE_BUY_BOLL_SLOPE_INVALID",
+    )]
+
+
+@pytest.mark.parametrize("boll_mid_slope", [-0.01, None])
+def test_formal_buy_eligibility_does_not_use_boll_slope(
+        monkeypatch, boll_mid_slope):
+    code = "510300.XSHG"
+    snapshot = resonance_snapshot(code, boll_mid_slope=boll_mid_slope)
+    if boll_mid_slope is None:
+        snapshot["observation_values"].pop("boll_mid_slope")
+    monkeypatch.setattr(strategy, "g", runtime_state(), raising=False)
+    monkeypatch.setattr(
+        strategy, "log_resonance_decision", lambda *args: None,
+        raising=False,
+    )
+
+    decisions = strategy.collect_buy_decisions({code: snapshot}, set())
+
+    assert [decision["code"] for decision in decisions] == [code]
+
+
+def test_negative_higher_ranked_relative_buy_does_not_consume_backfill_slot(
+        monkeypatch):
+    rejected_code = "159915.XSHE"
+    eligible_code = "510300.XSHG"
+    rejected = relative_buy_snapshot(rejected_code, -0.01)
+    eligible = resonance_snapshot(eligible_code, boll_mid_slope=0.01)
+    eligible["event_book"] = event_book_for_directions(
+        "BUY_TURN", "NEUTRAL", "NEUTRAL", "2021-01-05",
+    )
+    eligible["relative_event_book"] = relative_event_book_for_directions(
+        "NEUTRAL", "BUY_TURN", "NEUTRAL", "2021-01-05",
+    )
+    monkeypatch.setattr(
+        strategy, "log_resonance_decision", lambda *args: None,
+        raising=False,
+    )
+
+    decisions = strategy.prepare_relative_buy_decisions({
+        rejected_code: rejected,
+        eligible_code: eligible,
+    })
+
+    assert [decision["code"] for decision in decisions] == [eligible_code]
+    assert decisions[0]["support_count"] == 2
 
 
 def test_relative_buy_collection_error_does_not_block_formal_buy(monkeypatch):
