@@ -9,10 +9,11 @@ from numbers import Real
 
 
 STRATEGY_VERSION = "resonance-v0.1.0"
-DEPLOYMENT_BUILD_ID = "20260828.5"
+DEPLOYMENT_BUILD_ID = "20260901.4"
 FORMAL_EVENT_LOGIC_BUILD_ID = "20260827.3"
 ATR_EXIT_POLICY = "OBSERVE_ONLY"
 RELATIVE_BUY_POLICY = "EMPTY_SLOT_BACKFILL"
+RELATIVE_BUY_PRIORITY_POLICY = "DMI_NEGATIVE_FIRST"
 BENCHMARK = "000300.XSHG"
 
 
@@ -872,6 +873,7 @@ def initialize(context):
         "relative_observation_fingerprint": relative_observation_fingerprint(),
         "atr_exit_policy": ATR_EXIT_POLICY,
         "relative_buy_policy": RELATIVE_BUY_POLICY,
+        "relative_buy_priority_policy": RELATIVE_BUY_PRIORITY_POLICY,
         "etf_pool": list(g.etf_pool),
     })
 
@@ -2120,10 +2122,28 @@ def collect_relative_buy_decisions(snapshots):
     return decisions
 
 
+def relative_buy_dmi_priority(snapshot):
+    observation_values = snapshot.get("observation_values") or {}
+    plus_di = _finite_float(observation_values.get("plus_di"))
+    minus_di = _finite_float(observation_values.get("minus_di"))
+    return int(not (
+        plus_di is not None
+        and minus_di is not None
+        and plus_di < minus_di
+    ))
+
+
+def sort_relative_buy_decisions(decisions, snapshots):
+    original_order = sort_buy_decisions(decisions)
+    return sorted(original_order, key=lambda item: relative_buy_dmi_priority(
+        snapshots.get(item["code"]) or {},
+    ))
+
+
 def prepare_relative_buy_decisions(snapshots):
     try:
-        return tuple(sort_buy_decisions(
-            collect_relative_buy_decisions(snapshots)
+        return tuple(sort_relative_buy_decisions(
+            collect_relative_buy_decisions(snapshots), snapshots,
         ))
     except Exception as error:
         if _is_future_data_error(error):

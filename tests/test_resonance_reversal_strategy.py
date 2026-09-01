@@ -3040,9 +3040,10 @@ def test_initialize_emits_version_and_separate_configuration_fingerprints(
     payload = json.loads(messages[-1])
     assert payload["event"] == "strategy_initialized"
     assert payload["version"] == strategy.STRATEGY_VERSION
-    assert payload["build"] == "20260828.5"
+    assert payload["build"] == "20260901.4"
     assert payload["atr_exit_policy"] == "OBSERVE_ONLY"
     assert payload["relative_buy_policy"] == "EMPTY_SLOT_BACKFILL"
+    assert payload["relative_buy_priority_policy"] == "DMI_NEGATIVE_FIRST"
     assert payload["parameter_fingerprint"]
     assert payload["pool_fingerprint"]
 
@@ -3591,7 +3592,7 @@ def _event_diagnostic_frame(previous_overrides=None, current_overrides=None):
 
 
 def test_diagnostic_build_id_is_bumped():
-    assert strategy.DEPLOYMENT_BUILD_ID == "20260828.5"
+    assert strategy.DEPLOYMENT_BUILD_ID == "20260901.4"
 
 
 def test_relative_observation_build_and_formal_fingerprints_are_separated(
@@ -3603,10 +3604,11 @@ def test_relative_observation_build_and_formal_fingerprints_are_separated(
     strategy.initialize(types.SimpleNamespace())
 
     payload = json.loads(messages[-1])
-    assert strategy.DEPLOYMENT_BUILD_ID == "20260828.5"
-    assert payload["build"] == "20260828.5"
+    assert strategy.DEPLOYMENT_BUILD_ID == "20260901.4"
+    assert payload["build"] == "20260901.4"
     assert payload["atr_exit_policy"] == "OBSERVE_ONLY"
     assert payload["relative_buy_policy"] == "EMPTY_SLOT_BACKFILL"
+    assert payload["relative_buy_priority_policy"] == "DMI_NEGATIVE_FIRST"
     assert payload["parameter_fingerprint"] == "e1227fbd8b4a884e"
     assert payload["pool_fingerprint"] == "9123995edeb1ed84"
     assert payload["event_logic_fingerprint"] == "1c0b8a22f48c97c3"
@@ -4053,6 +4055,76 @@ def test_relative_buy_backfills_only_after_formal_buy(monkeypatch):
         (formal_code, strategy.OrderOutcome.FILLED),
         (relative_code, strategy.OrderOutcome.FILLED),
     ]
+
+
+def test_relative_buy_priority_prefers_negative_dmi_then_original_order(
+        monkeypatch):
+    negative_strong = {
+        "code": "513100.XSHG", "support_count": 3, "boll_age": 1,
+    }
+    negative_weaker = {
+        "code": "510300.XSHG", "support_count": 2, "boll_age": 0,
+    }
+    nonnegative_strong = {
+        "code": "159915.XSHE", "support_count": 3, "boll_age": 0,
+    }
+    decisions = [nonnegative_strong, negative_weaker, negative_strong]
+    snapshots = {
+        "513100.XSHG": {
+            "observation_values": {"plus_di": 20.0, "minus_di": 30.0},
+        },
+        "510300.XSHG": {
+            "observation_values": {"plus_di": 25.0, "minus_di": 26.0},
+        },
+        "159915.XSHE": {
+            "observation_values": {"plus_di": 31.0, "minus_di": 30.0},
+        },
+    }
+    monkeypatch.setattr(
+        strategy, "collect_relative_buy_decisions",
+        lambda actual_snapshots: decisions,
+    )
+
+    prepared = strategy.prepare_relative_buy_decisions(snapshots)
+
+    assert [item["code"] for item in prepared] == [
+        "513100.XSHG", "510300.XSHG", "159915.XSHE",
+    ]
+
+
+def test_relative_buy_dmi_zero_and_invalid_values_remain_nonpreferred(
+        monkeypatch):
+    decisions = [
+        {"code": "513100.XSHG", "support_count": 3, "boll_age": 0},
+        {"code": "510300.XSHG", "support_count": 2, "boll_age": 0},
+        {"code": "159915.XSHE", "support_count": 3, "boll_age": 1},
+        {"code": "512100.XSHG", "support_count": 3, "boll_age": 0},
+    ]
+    snapshots = {
+        "513100.XSHG": {
+            "observation_values": {"plus_di": 20.0, "minus_di": 20.0},
+        },
+        "510300.XSHG": {
+            "observation_values": {"plus_di": 19.0, "minus_di": 20.0},
+        },
+        "159915.XSHE": {"observation_values": {}},
+        "512100.XSHG": {
+            "observation_values": {
+                "plus_di": float("nan"), "minus_di": 20.0,
+            },
+        },
+    }
+    monkeypatch.setattr(
+        strategy, "collect_relative_buy_decisions",
+        lambda actual_snapshots: decisions,
+    )
+
+    prepared = strategy.prepare_relative_buy_decisions(snapshots)
+
+    assert [item["code"] for item in prepared] == [
+        "510300.XSHG", "512100.XSHG", "513100.XSHG", "159915.XSHE",
+    ]
+    assert len(prepared) == len(decisions)
 
 
 def test_relative_buy_collection_error_does_not_block_formal_buy(monkeypatch):
