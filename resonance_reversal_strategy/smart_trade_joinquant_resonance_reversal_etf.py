@@ -9,11 +9,12 @@ from numbers import Real
 
 
 STRATEGY_VERSION = "resonance-v0.1.0"
-DEPLOYMENT_BUILD_ID = "20260901.4"
+DEPLOYMENT_BUILD_ID = "20260901.5"
 FORMAL_EVENT_LOGIC_BUILD_ID = "20260827.3"
 ATR_EXIT_POLICY = "OBSERVE_ONLY"
 RELATIVE_BUY_POLICY = "EMPTY_SLOT_BACKFILL"
 RELATIVE_BUY_PRIORITY_POLICY = "DMI_NEGATIVE_FIRST"
+RELATIVE_BUY_ATR_PRIORITY_POLICY = "T1_NORMALIZED_ATR_NONEXPANDING_FIRST"
 BENCHMARK = "000300.XSHG"
 
 
@@ -236,6 +237,9 @@ def log_signal_snapshot(snapshot):
         "reason": snapshot.get("reason"),
         "trade_values": dict(snapshot.get("trade_values") or {}),
         "observation_values": dict(snapshot.get("observation_values") or {}),
+        "relative_buy_priority_values": dict(
+            snapshot.get("relative_buy_priority_values") or {}
+        ),
         "event_detection_trace": dict(
             snapshot.get("event_detection_trace") or {}
         ),
@@ -874,6 +878,7 @@ def initialize(context):
         "atr_exit_policy": ATR_EXIT_POLICY,
         "relative_buy_policy": RELATIVE_BUY_POLICY,
         "relative_buy_priority_policy": RELATIVE_BUY_PRIORITY_POLICY,
+        "relative_buy_atr_priority_policy": RELATIVE_BUY_ATR_PRIORITY_POLICY,
         "etf_pool": list(g.etf_pool),
     })
 
@@ -888,6 +893,14 @@ def is_finite_positive(value):
     except (TypeError, ValueError):
         return False
     return bool(np.isfinite(numeric) and numeric > 0)
+
+
+def normalized_atr_value(row):
+    atr = row.get("atr14")
+    close = row.get("close")
+    if not is_finite_positive(atr) or not is_finite_positive(close):
+        return None
+    return float(atr) / float(close)
 
 
 def load_signal_price_frame(code, prev_date, lookback_days):
@@ -961,6 +974,10 @@ def build_signal_snapshot(code, prev_date, params, decision_date):
         "relative_event_book": relative_event_book,
         "trade_values": latest[required].to_dict(),
         "observation_values": latest[list(OBSERVATION_COLUMNS)].to_dict(),
+        "relative_buy_priority_values": {
+            "normalized_atr_t1": normalized_atr_value(latest),
+            "normalized_atr_t2": normalized_atr_value(previous),
+        },
         "event_detection_trace": event_detection_trace,
         "kdj_cross": detect_kdj_formal_cross(previous, latest),
     }
@@ -2133,10 +2150,20 @@ def relative_buy_dmi_priority(snapshot):
     ))
 
 
+def relative_buy_atr_priority(snapshot):
+    priority_values = snapshot.get("relative_buy_priority_values") or {}
+    current = priority_values.get("normalized_atr_t1")
+    previous = priority_values.get("normalized_atr_t2")
+    if not is_finite_positive(current) or not is_finite_positive(previous):
+        return 2
+    return int(float(current) > float(previous))
+
+
 def sort_relative_buy_decisions(decisions, snapshots):
     original_order = sort_buy_decisions(decisions)
-    return sorted(original_order, key=lambda item: relative_buy_dmi_priority(
-        snapshots.get(item["code"]) or {},
+    return sorted(original_order, key=lambda item: (
+        relative_buy_dmi_priority(snapshots.get(item["code"]) or {}),
+        relative_buy_atr_priority(snapshots.get(item["code"]) or {}),
     ))
 
 

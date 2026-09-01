@@ -1369,6 +1369,39 @@ def test_build_signal_snapshot_keeps_observations_out_of_event_builder(
     assert captured[0][1:] == (signal_date, decision_date)
 
 
+def test_signal_snapshot_records_t1_t2_normalized_atr_for_relative_priority(
+        monkeypatch):
+    params = strategy.get_default_params()
+    price_frame = make_ohlcv_frame(params["lookback_days"])
+    indicators = strategy.build_indicator_frame(price_frame, params)
+    indicators.loc[indicators.index[-2], ["atr14", "close"]] = [2.0, 20.0]
+    indicators.loc[indicators.index[-1], ["atr14", "close"]] = [1.0, 10.0]
+    monkeypatch.setattr(
+        strategy, "load_signal_price_frame", lambda *args: price_frame,
+    )
+    monkeypatch.setattr(
+        strategy, "build_indicator_frame", lambda *args: indicators,
+    )
+    monkeypatch.setattr(
+        strategy, "collect_latest_events",
+        lambda *args: strategy.empty_event_book(),
+    )
+    monkeypatch.setattr(
+        strategy, "collect_latest_relative_events",
+        lambda *args: strategy.empty_event_book(),
+    )
+
+    snapshot = strategy.build_signal_snapshot(
+        "510300.XSHG", indicators.index[-1], params,
+        indicators.index[-1] + pd.offsets.BDay(1),
+    )
+
+    assert snapshot["relative_buy_priority_values"] == {
+        "normalized_atr_t1": pytest.approx(0.1),
+        "normalized_atr_t2": pytest.approx(0.1),
+    }
+
+
 @pytest.mark.parametrize("invalid_atr", [np.nan, np.inf, -np.inf, 0.0])
 def test_invalid_current_atr_blocks_only_new_buy_not_existing_signal_exit(
         monkeypatch, invalid_atr):
@@ -2940,6 +2973,10 @@ def test_structured_logging_contract_contains_required_audit_fields(
             "volume_ma20": 800.0, "volume_ratio": 1.25,
             "boll_width": 0.2, "boll_mid_slope": 0.1,
         },
+        "relative_buy_priority_values": {
+            "normalized_atr_t1": 0.05,
+            "normalized_atr_t2": 0.06,
+        },
     })
     decision = strategy.build_resonance_decision(
         snapshot["code"], strategy.TurnDirection.BUY_TURN,
@@ -2965,6 +3002,10 @@ def test_structured_logging_contract_contains_required_audit_fields(
     assert set(signal_payload["trade_values"]) == set(strategy.TRADE_INDICATOR_COLUMNS)
     assert set(signal_payload["observation_values"]) == set(strategy.OBSERVATION_COLUMNS)
     assert signal_payload["observation_values"]["adx14"] is None
+    assert signal_payload["relative_buy_priority_values"] == {
+        "normalized_atr_t1": 0.05,
+        "normalized_atr_t2": 0.06,
+    }
     assert "active_events" in signal_payload
     assert "invalidated_events" in signal_payload
 
@@ -3040,10 +3081,13 @@ def test_initialize_emits_version_and_separate_configuration_fingerprints(
     payload = json.loads(messages[-1])
     assert payload["event"] == "strategy_initialized"
     assert payload["version"] == strategy.STRATEGY_VERSION
-    assert payload["build"] == "20260901.4"
+    assert payload["build"] == "20260901.5"
     assert payload["atr_exit_policy"] == "OBSERVE_ONLY"
     assert payload["relative_buy_policy"] == "EMPTY_SLOT_BACKFILL"
     assert payload["relative_buy_priority_policy"] == "DMI_NEGATIVE_FIRST"
+    assert payload["relative_buy_atr_priority_policy"] == (
+        "T1_NORMALIZED_ATR_NONEXPANDING_FIRST"
+    )
     assert payload["parameter_fingerprint"]
     assert payload["pool_fingerprint"]
 
@@ -3592,7 +3636,7 @@ def _event_diagnostic_frame(previous_overrides=None, current_overrides=None):
 
 
 def test_diagnostic_build_id_is_bumped():
-    assert strategy.DEPLOYMENT_BUILD_ID == "20260901.4"
+    assert strategy.DEPLOYMENT_BUILD_ID == "20260901.5"
 
 
 def test_relative_observation_build_and_formal_fingerprints_are_separated(
@@ -3604,11 +3648,14 @@ def test_relative_observation_build_and_formal_fingerprints_are_separated(
     strategy.initialize(types.SimpleNamespace())
 
     payload = json.loads(messages[-1])
-    assert strategy.DEPLOYMENT_BUILD_ID == "20260901.4"
-    assert payload["build"] == "20260901.4"
+    assert strategy.DEPLOYMENT_BUILD_ID == "20260901.5"
+    assert payload["build"] == "20260901.5"
     assert payload["atr_exit_policy"] == "OBSERVE_ONLY"
     assert payload["relative_buy_policy"] == "EMPTY_SLOT_BACKFILL"
     assert payload["relative_buy_priority_policy"] == "DMI_NEGATIVE_FIRST"
+    assert payload["relative_buy_atr_priority_policy"] == (
+        "T1_NORMALIZED_ATR_NONEXPANDING_FIRST"
+    )
     assert payload["parameter_fingerprint"] == "e1227fbd8b4a884e"
     assert payload["pool_fingerprint"] == "9123995edeb1ed84"
     assert payload["event_logic_fingerprint"] == "1c0b8a22f48c97c3"
@@ -4090,6 +4137,68 @@ def test_relative_buy_priority_prefers_negative_dmi_then_original_order(
     assert [item["code"] for item in prepared] == [
         "513100.XSHG", "510300.XSHG", "159915.XSHE",
     ]
+
+
+@pytest.mark.parametrize(("current", "previous", "expected"), [
+    (0.05, 0.06, 0),
+    (0.05, 0.05, 0),
+    (0.06, 0.05, 1),
+    (None, 0.05, 2),
+    (0.05, None, 2),
+    (float("nan"), 0.05, 2),
+    (0.0, 0.05, 2),
+])
+def test_relative_buy_atr_priority_truth_table(current, previous, expected):
+    snapshot = {
+        "relative_buy_priority_values": {
+            "normalized_atr_t1": current,
+            "normalized_atr_t2": previous,
+        },
+    }
+
+    assert strategy.relative_buy_atr_priority(snapshot) == expected
+
+
+def test_relative_buy_priority_keeps_dmi_primary_and_uses_atr_secondary(
+        monkeypatch):
+    decisions = [
+        {"code": "159915.XSHE", "support_count": 3, "boll_age": 0},
+        {"code": "512100.XSHG", "support_count": 2, "boll_age": 0},
+        {"code": "588000.XSHG", "support_count": 3, "boll_age": 1},
+        {"code": "513100.XSHG", "support_count": 3, "boll_age": 0},
+        {"code": "510300.XSHG", "support_count": 2, "boll_age": 0},
+    ]
+
+    def priority_snapshot(plus_di, minus_di, current=None, previous=None):
+        return {
+            "observation_values": {
+                "plus_di": plus_di, "minus_di": minus_di,
+            },
+            "relative_buy_priority_values": {
+                "normalized_atr_t1": current,
+                "normalized_atr_t2": previous,
+            },
+        }
+
+    snapshots = {
+        "513100.XSHG": priority_snapshot(20.0, 30.0, 0.06, 0.05),
+        "510300.XSHG": priority_snapshot(20.0, 30.0, 0.05, 0.06),
+        "159915.XSHE": priority_snapshot(30.0, 20.0, 0.06, 0.05),
+        "512100.XSHG": priority_snapshot(30.0, 20.0, 0.05, 0.06),
+        "588000.XSHG": priority_snapshot(30.0, 20.0),
+    }
+    monkeypatch.setattr(
+        strategy, "collect_relative_buy_decisions",
+        lambda actual_snapshots: decisions,
+    )
+
+    prepared = strategy.prepare_relative_buy_decisions(snapshots)
+
+    assert [item["code"] for item in prepared] == [
+        "510300.XSHG", "513100.XSHG", "512100.XSHG",
+        "159915.XSHE", "588000.XSHG",
+    ]
+    assert set(item["code"] for item in prepared) == set(snapshots)
 
 
 def test_relative_buy_dmi_zero_and_invalid_values_remain_nonpreferred(
