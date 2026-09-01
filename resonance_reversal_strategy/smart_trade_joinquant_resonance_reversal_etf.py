@@ -9,11 +9,12 @@ from numbers import Real
 
 
 STRATEGY_VERSION = "resonance-v0.1.0"
-DEPLOYMENT_BUILD_ID = "20260901.4"
+DEPLOYMENT_BUILD_ID = "20260901.6"
 FORMAL_EVENT_LOGIC_BUILD_ID = "20260827.3"
 ATR_EXIT_POLICY = "OBSERVE_ONLY"
 RELATIVE_BUY_POLICY = "EMPTY_SLOT_BACKFILL"
 RELATIVE_BUY_PRIORITY_POLICY = "DMI_NEGATIVE_FIRST"
+BUY_EXECUTION_PRIORITY_POLICY = "SUPPORT_COUNT_THEN_SOURCE"
 BENCHMARK = "000300.XSHG"
 
 
@@ -874,6 +875,7 @@ def initialize(context):
         "atr_exit_policy": ATR_EXIT_POLICY,
         "relative_buy_policy": RELATIVE_BUY_POLICY,
         "relative_buy_priority_policy": RELATIVE_BUY_PRIORITY_POLICY,
+        "buy_execution_priority_policy": BUY_EXECUTION_PRIORITY_POLICY,
         "etf_pool": list(g.etf_pool),
     })
 
@@ -2412,7 +2414,14 @@ def run_signal_buys(
         log_resonance_decision(
             decision, True, "RELATIVE_BUY_CANDIDATE_SORTED:%s" % rank,
         )
-    sorted_decisions = tuple(formal_decisions) + relative_decisions
+    sorted_decisions = tuple(sorted(
+        tuple(formal_decisions) + relative_decisions,
+        key=lambda item: -item["support_count"],
+    ))
+    for rank, decision in enumerate(sorted_decisions, start=1):
+        log_resonance_decision(
+            decision, True, "BUY_EXECUTION_CANDIDATE_SORTED:%s" % rank,
+        )
     remaining_slots = max(
         0, g.params["max_holdings"] - len(actual_positions),
     )

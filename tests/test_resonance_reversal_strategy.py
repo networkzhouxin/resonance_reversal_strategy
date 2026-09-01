@@ -3040,10 +3040,13 @@ def test_initialize_emits_version_and_separate_configuration_fingerprints(
     payload = json.loads(messages[-1])
     assert payload["event"] == "strategy_initialized"
     assert payload["version"] == strategy.STRATEGY_VERSION
-    assert payload["build"] == "20260901.4"
+    assert payload["build"] == "20260901.6"
     assert payload["atr_exit_policy"] == "OBSERVE_ONLY"
     assert payload["relative_buy_policy"] == "EMPTY_SLOT_BACKFILL"
     assert payload["relative_buy_priority_policy"] == "DMI_NEGATIVE_FIRST"
+    assert payload["buy_execution_priority_policy"] == (
+        "SUPPORT_COUNT_THEN_SOURCE"
+    )
     assert payload["parameter_fingerprint"]
     assert payload["pool_fingerprint"]
 
@@ -3592,7 +3595,7 @@ def _event_diagnostic_frame(previous_overrides=None, current_overrides=None):
 
 
 def test_diagnostic_build_id_is_bumped():
-    assert strategy.DEPLOYMENT_BUILD_ID == "20260901.4"
+    assert strategy.DEPLOYMENT_BUILD_ID == "20260901.6"
 
 
 def test_relative_observation_build_and_formal_fingerprints_are_separated(
@@ -3604,11 +3607,14 @@ def test_relative_observation_build_and_formal_fingerprints_are_separated(
     strategy.initialize(types.SimpleNamespace())
 
     payload = json.loads(messages[-1])
-    assert strategy.DEPLOYMENT_BUILD_ID == "20260901.4"
-    assert payload["build"] == "20260901.4"
+    assert strategy.DEPLOYMENT_BUILD_ID == "20260901.6"
+    assert payload["build"] == "20260901.6"
     assert payload["atr_exit_policy"] == "OBSERVE_ONLY"
     assert payload["relative_buy_policy"] == "EMPTY_SLOT_BACKFILL"
     assert payload["relative_buy_priority_policy"] == "DMI_NEGATIVE_FIRST"
+    assert payload["buy_execution_priority_policy"] == (
+        "SUPPORT_COUNT_THEN_SOURCE"
+    )
     assert payload["parameter_fingerprint"] == "e1227fbd8b4a884e"
     assert payload["pool_fingerprint"] == "9123995edeb1ed84"
     assert payload["event_logic_fingerprint"] == "1c0b8a22f48c97c3"
@@ -4003,7 +4009,8 @@ def test_formal_observation_outcome_log_has_no_relative_contract_fields(
     assert forbidden.isdisjoint(payload)
 
 
-def test_relative_buy_backfills_only_after_formal_buy(monkeypatch):
+def test_cross_source_priority_fills_all_available_slots_in_sorted_order(
+        monkeypatch):
     formal_code = "510300.XSHG"
     relative_code = "159915.XSHE"
     formal_snapshot = resonance_snapshot(formal_code)
@@ -4050,10 +4057,10 @@ def test_relative_buy_backfills_only_after_formal_buy(monkeypatch):
         context, current_data, snapshots, relative_decisions,
     )
 
-    assert submitted == [formal_code, relative_code]
+    assert submitted == [relative_code, formal_code]
     assert results == [
-        (formal_code, strategy.OrderOutcome.FILLED),
         (relative_code, strategy.OrderOutcome.FILLED),
+        (formal_code, strategy.OrderOutcome.FILLED),
     ]
 
 
@@ -4185,7 +4192,7 @@ def test_relative_buy_collection_error_does_not_block_formal_buy(monkeypatch):
     )]
 
 
-def test_formal_buy_keeps_priority_when_relative_buy_competes_for_last_slot(
+def test_three_support_relative_buy_precedes_two_support_formal_for_last_slot(
         monkeypatch):
     formal_code = "510300.XSHG"
     relative_code = "159915.XSHE"
@@ -4240,9 +4247,139 @@ def test_formal_buy_keeps_priority_when_relative_buy_competes_for_last_slot(
         relative_decisions,
     )
 
+    assert submitted == [relative_code]
+    assert results == [(relative_code, strategy.OrderOutcome.FILLED)]
+    assert (
+        relative_code, True, "BUY_EXECUTION_CANDIDATE_SORTED:1",
+    ) in reasons
+    assert (
+        formal_code, True, "BUY_EXECUTION_CANDIDATE_SORTED:2",
+    ) in reasons
+    assert (formal_code, False, "PORTFOLIO_FULL") in reasons
+
+
+def test_equal_support_keeps_formal_before_relative_for_last_slot(monkeypatch):
+    formal_code = "510300.XSHG"
+    relative_code = "159915.XSHE"
+    formal_snapshot = resonance_snapshot(formal_code, support_count=3)
+    relative_snapshot = resonance_snapshot(relative_code)
+    relative_snapshot["event_book"] = strategy.empty_event_book()
+    relative_snapshot["relative_event_book"] = (
+        relative_event_book_for_directions(
+            "BUY_TURN", "BUY_TURN", "BUY_TURN", "2021-01-05",
+        )
+    )
+    runtime = runtime_state(max_holdings=1)
+    context = fake_context()
+    current_data = {
+        formal_code: current_record(), relative_code: current_record(),
+    }
+    submitted = []
+    monkeypatch.setattr(strategy, "g", runtime, raising=False)
+    monkeypatch.setattr(
+        strategy, "get_current_data", lambda: current_data, raising=False,
+    )
+    monkeypatch.setattr(
+        strategy, "log_resonance_decision", lambda *args: None,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        strategy, "log_order_transition", lambda *args: None, raising=False,
+    )
+
+    def fill_order(code, target_value):
+        submitted.append(code)
+        context.portfolio.positions[code] = fake_position(100)
+        return types.SimpleNamespace(amount=100, filled=100)
+
+    monkeypatch.setattr(
+        strategy, "order_target_value", fill_order, raising=False,
+    )
+
+    snapshots = {
+        formal_code: formal_snapshot,
+        relative_code: relative_snapshot,
+    }
+    relative_decisions = strategy.prepare_relative_buy_decisions(snapshots)
+
+    results = strategy.run_signal_buys(
+        context, current_data, snapshots, relative_decisions,
+    )
+
     assert submitted == [formal_code]
     assert results == [(formal_code, strategy.OrderOutcome.FILLED)]
-    assert (relative_code, False, "PORTFOLIO_FULL") in reasons
+
+
+def test_support_count_precedes_relative_dmi_across_support_groups(monkeypatch):
+    negative_two_code = "510300.XSHG"
+    nonnegative_three_code = "159915.XSHE"
+    negative_two_snapshot = resonance_snapshot(negative_two_code)
+    negative_two_snapshot["event_book"] = event_book_for_directions(
+        "BUY_TURN", "NEUTRAL", "NEUTRAL", "2021-01-05",
+    )
+    negative_two_snapshot["relative_event_book"] = (
+        relative_event_book_for_directions(
+            "NEUTRAL", "BUY_TURN", "NEUTRAL", "2021-01-05",
+        )
+    )
+    negative_two_snapshot["observation_values"] = {
+        "plus_di": 20.0, "minus_di": 30.0,
+    }
+    nonnegative_three_snapshot = resonance_snapshot(nonnegative_three_code)
+    nonnegative_three_snapshot["event_book"] = strategy.empty_event_book()
+    nonnegative_three_snapshot["relative_event_book"] = (
+        relative_event_book_for_directions(
+            "BUY_TURN", "BUY_TURN", "BUY_TURN", "2021-01-05",
+        )
+    )
+    nonnegative_three_snapshot["observation_values"] = {
+        "plus_di": 31.0, "minus_di": 30.0,
+    }
+    runtime = runtime_state(max_holdings=1)
+    context = fake_context()
+    current_data = {
+        negative_two_code: current_record(),
+        nonnegative_three_code: current_record(),
+    }
+    submitted = []
+    monkeypatch.setattr(strategy, "g", runtime, raising=False)
+    monkeypatch.setattr(
+        strategy, "get_current_data", lambda: current_data, raising=False,
+    )
+    monkeypatch.setattr(
+        strategy, "log_resonance_decision", lambda *args: None,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        strategy, "log_order_transition", lambda *args: None, raising=False,
+    )
+
+    def fill_order(code, target_value):
+        submitted.append(code)
+        context.portfolio.positions[code] = fake_position(100)
+        return types.SimpleNamespace(amount=100, filled=100)
+
+    monkeypatch.setattr(
+        strategy, "order_target_value", fill_order, raising=False,
+    )
+
+    snapshots = {
+        negative_two_code: negative_two_snapshot,
+        nonnegative_three_code: nonnegative_three_snapshot,
+    }
+    relative_decisions = strategy.prepare_relative_buy_decisions(snapshots)
+    assert [item["code"] for item in relative_decisions] == [
+        negative_two_code, nonnegative_three_code,
+    ]
+
+    results = strategy.run_signal_buys(
+        context, current_data, snapshots, relative_decisions,
+    )
+
+    assert submitted == [nonnegative_three_code]
+    assert results == [(
+        nonnegative_three_code, strategy.OrderOutcome.FILLED,
+    )]
 
 
 def test_relative_sell_observation_never_enters_buy_or_sell_execution(
@@ -4601,7 +4738,7 @@ def test_relative_signal_snapshot_log_failure_keeps_formal_pipeline(
     assert calls == ["retry", "atr", "exits", "buys"]
 
 
-def test_relative_sidecar_states_leave_real_formal_execution_equivalent(
+def test_relative_sidecar_failure_leaves_real_formal_execution_equivalent(
         monkeypatch):
     code = "510300.XSHG"
     observation = {
@@ -4667,8 +4804,9 @@ def test_relative_sidecar_states_leave_real_formal_execution_equivalent(
         ),
     ]
 
-    assert outcomes[0] == outcomes[1] == outcomes[2]
-    assert outcomes[0]["orders"]
+    assert outcomes[1] == outcomes[2]
+    assert outcomes[1]["orders"]
+    assert set(outcomes[0]["processed"]) == {"RELATIVE:metamorphic"}
 
 
 def test_damaged_relative_observation_isolated_before_formal_after_close(
