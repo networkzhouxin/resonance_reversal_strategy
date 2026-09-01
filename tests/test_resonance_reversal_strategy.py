@@ -1245,7 +1245,7 @@ def test_flat_position_clears_only_its_risk_state(monkeypatch):
 
 
 def resonance_snapshot(code, direction="BUY_TURN", signal_date="2021-01-05",
-                       support_count=2):
+                       support_count=3):
     kdj = direction if support_count == 3 else "NEUTRAL"
     book = event_book_for_directions(
         direction, direction, kdj, signal_date,
@@ -2315,7 +2315,7 @@ def test_current_quote_does_not_change_frozen_buy_candidate_order(monkeypatch):
     first, second = "159915.XSHE", "510300.XSHG"
     snapshots = {
         first: resonance_snapshot(first, support_count=3),
-        second: resonance_snapshot(second, support_count=2),
+        second: resonance_snapshot(second, support_count=3),
     }
     observed_orders = []
 
@@ -3040,9 +3040,10 @@ def test_initialize_emits_version_and_separate_configuration_fingerprints(
     payload = json.loads(messages[-1])
     assert payload["event"] == "strategy_initialized"
     assert payload["version"] == strategy.STRATEGY_VERSION
-    assert payload["build"] == "20260828.5"
+    assert payload["build"] == "20260901.2"
     assert payload["atr_exit_policy"] == "OBSERVE_ONLY"
     assert payload["relative_buy_policy"] == "EMPTY_SLOT_BACKFILL"
+    assert payload["new_buy_support_policy"] == "ALL_THREE_ENTRY_ONLY"
     assert payload["parameter_fingerprint"]
     assert payload["pool_fingerprint"]
 
@@ -3195,6 +3196,105 @@ def test_buy_rejection_logs_third_indicator_conflict_and_stale_support(
         (conflict_code, False, "THIRD_INDICATOR_CONFLICT"),
         (stale_code, False, "NO_FRESH_SUPPORTER"),
     ]
+
+
+def test_formal_new_buy_requires_all_three_supporters(monkeypatch):
+    weak_code = "510300.XSHG"
+    strong_code = "159915.XSHE"
+    weak = resonance_snapshot(weak_code, support_count=2)
+    strong = resonance_snapshot(strong_code, support_count=3)
+    reasons = []
+    monkeypatch.setattr(
+        strategy, "try_register_observation_event", lambda *args: None,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        strategy, "log_resonance_decision",
+        lambda decision, accepted, reason: reasons.append(
+            (decision["code"], accepted, reason)
+        ),
+        raising=False,
+    )
+
+    decisions = strategy.collect_buy_decisions(
+        {weak_code: weak, strong_code: strong}, {},
+    )
+
+    assert [decision["code"] for decision in decisions] == [strong_code]
+    assert (weak_code, False, "ALL_THREE_ENTRY_REQUIRED") in reasons
+
+
+@pytest.mark.parametrize(
+    ("supporters", "support_count", "expected"),
+    [
+        (("BOLL", "RSI", "KDJ"), 3, True),
+        (("BOLL", "RSI"), 2, False),
+        (("BOLL", "RSI", "RSI"), 3, False),
+        (("BOLL", "RSI", "KDJ", "EXTRA"), 4, False),
+    ],
+)
+def test_all_three_entry_support_requires_exact_indicator_set(
+        supporters, support_count, expected):
+    decision = {
+        "supporters": supporters,
+        "support_count": support_count,
+    }
+
+    assert strategy.has_all_three_entry_support(decision) is expected
+
+
+def test_relative_new_buy_requires_all_three_supporters(monkeypatch):
+    weak_code = "510300.XSHG"
+    strong_code = "159915.XSHE"
+    weak = resonance_snapshot(weak_code)
+    weak["event_book"] = event_book_for_directions(
+        "BUY_TURN", "NEUTRAL", "NEUTRAL", "2021-01-05",
+    )
+    weak["relative_event_book"] = relative_event_book_for_directions(
+        "NEUTRAL", "BUY_TURN", "NEUTRAL", "2021-01-05",
+    )
+    strong = resonance_snapshot(strong_code)
+    strong["event_book"] = strategy.empty_event_book()
+    strong["relative_event_book"] = relative_event_book_for_directions(
+        "BUY_TURN", "BUY_TURN", "BUY_TURN", "2021-01-05",
+    )
+    reasons = []
+    monkeypatch.setattr(
+        strategy, "log_resonance_decision",
+        lambda decision, accepted, reason: reasons.append(
+            (decision["code"], accepted, reason)
+        ),
+        raising=False,
+    )
+
+    decisions = strategy.collect_relative_buy_decisions(
+        {weak_code: weak, strong_code: strong},
+    )
+
+    assert [decision["code"] for decision in decisions] == [strong_code]
+    assert (weak_code, False, "ALL_THREE_ENTRY_REQUIRED") in reasons
+
+
+def test_all_three_entry_rule_does_not_filter_two_support_sell_decision(
+        monkeypatch):
+    code = "510300.XSHG"
+    snapshot = resonance_snapshot(
+        code, direction="SELL_TURN", support_count=2,
+    )
+    monkeypatch.setattr(
+        strategy, "try_register_observation_event", lambda *args: None,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        strategy, "log_resonance_decision", lambda *args: None,
+        raising=False,
+    )
+
+    decisions = strategy.collect_complete_resonance_decisions(
+        {code: snapshot}, strategy.TurnDirection.SELL_TURN,
+    )
+
+    assert decisions[code]["support_count"] == 2
 
 
 def test_empty_no_event_pool_emits_no_resonance_rejection_logs(monkeypatch):
@@ -3510,7 +3610,7 @@ def test_kdj_cross_field_cannot_change_candidate_order_or_orders(monkeypatch):
         snapshots = {
             first: dict(resonance_snapshot(first, support_count=3),
                         kdj_cross=first_cross),
-            second: dict(resonance_snapshot(second, support_count=2),
+            second: dict(resonance_snapshot(second, support_count=3),
                          kdj_cross=second_cross),
         }
         monkeypatch.setattr(strategy, "g", runtime, raising=False)
@@ -3590,8 +3690,8 @@ def _event_diagnostic_frame(previous_overrides=None, current_overrides=None):
     )
 
 
-def test_diagnostic_build_id_is_bumped():
-    assert strategy.DEPLOYMENT_BUILD_ID == "20260828.5"
+def test_all_three_entry_candidate_has_separate_build_id():
+    assert strategy.DEPLOYMENT_BUILD_ID == "20260901.2"
 
 
 def test_relative_observation_build_and_formal_fingerprints_are_separated(
@@ -3603,10 +3703,11 @@ def test_relative_observation_build_and_formal_fingerprints_are_separated(
     strategy.initialize(types.SimpleNamespace())
 
     payload = json.loads(messages[-1])
-    assert strategy.DEPLOYMENT_BUILD_ID == "20260828.5"
-    assert payload["build"] == "20260828.5"
+    assert strategy.DEPLOYMENT_BUILD_ID == "20260901.2"
+    assert payload["build"] == "20260901.2"
     assert payload["atr_exit_policy"] == "OBSERVE_ONLY"
     assert payload["relative_buy_policy"] == "EMPTY_SLOT_BACKFILL"
+    assert payload["new_buy_support_policy"] == "ALL_THREE_ENTRY_ONLY"
     assert payload["parameter_fingerprint"] == "e1227fbd8b4a884e"
     assert payload["pool_fingerprint"] == "9123995edeb1ed84"
     assert payload["event_logic_fingerprint"] == "1c0b8a22f48c97c3"

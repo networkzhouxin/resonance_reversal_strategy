@@ -9,10 +9,11 @@ from numbers import Real
 
 
 STRATEGY_VERSION = "resonance-v0.1.0"
-DEPLOYMENT_BUILD_ID = "20260828.5"
+DEPLOYMENT_BUILD_ID = "20260901.2"
 FORMAL_EVENT_LOGIC_BUILD_ID = "20260827.3"
 ATR_EXIT_POLICY = "OBSERVE_ONLY"
 RELATIVE_BUY_POLICY = "EMPTY_SLOT_BACKFILL"
+NEW_BUY_SUPPORT_POLICY = "ALL_THREE_ENTRY_ONLY"
 BENCHMARK = "000300.XSHG"
 
 
@@ -872,6 +873,7 @@ def initialize(context):
         "relative_observation_fingerprint": relative_observation_fingerprint(),
         "atr_exit_policy": ATR_EXIT_POLICY,
         "relative_buy_policy": RELATIVE_BUY_POLICY,
+        "new_buy_support_policy": NEW_BUY_SUPPORT_POLICY,
         "etf_pool": list(g.etf_pool),
     })
 
@@ -2104,11 +2106,25 @@ def make_relative_buy_decision(observation):
     }
 
 
+def has_all_three_entry_support(decision):
+    supporters = tuple(decision.get("supporters") or ())
+    return bool(
+        decision.get("support_count") == len(INDICATORS)
+        and len(supporters) == len(INDICATORS)
+        and set(supporters) == set(INDICATORS)
+    )
+
+
 def collect_relative_buy_decisions(snapshots):
     decisions = []
     for observation in collect_relative_resonance_observations(snapshots):
         decision = make_relative_buy_decision(observation)
         if decision is None:
+            continue
+        if not has_all_three_entry_support(decision):
+            log_resonance_decision(
+                decision, False, "ALL_THREE_ENTRY_REQUIRED",
+            )
             continue
         code = decision["code"]
         if not is_finite_positive(snapshots[code].get("entry_atr")):
@@ -2273,6 +2289,11 @@ def collect_buy_decisions(snapshots, actual_positions):
     )
     decisions = []
     for code, decision in complete.items():
+        if not has_all_three_entry_support(decision):
+            log_resonance_decision(
+                decision, False, "ALL_THREE_ENTRY_REQUIRED",
+            )
+            continue
         if not is_finite_positive(snapshots[code].get("entry_atr")):
             log_resonance_decision(decision, False, "INVALID_ENTRY_ATR")
             continue
