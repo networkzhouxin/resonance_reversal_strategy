@@ -4,7 +4,17 @@
 
 - This repository contains only the independent `resonance_reversal_strategy`.
 - Only the strategy, its `research` tools, documentation, and `test_resonance*.py` tests are in scope.
-- Do not import, read, copy, modify, run, or validate any other strategy.
+- Other strategies may be inspected read-only as design references, including
+  their source code, documentation, and already-existing backtest evidence.
+- `resonance_reversal_strategy` remains the only strategy that may be modified,
+  run, or validated from this project. Do not modify, run, or validate a
+  referenced strategy.
+- Do not directly copy another strategy's code, parameters, or performance
+  conclusions. Convert any referenced design into an independently stated
+  hypothesis, then pre-register and validate it within this strategy's own
+  training boundary before considering adoption.
+- Do not use another strategy's validation-period or full-period results to
+  tune this strategy.
 
 ## Working Process
 
