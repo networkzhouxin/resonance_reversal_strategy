@@ -9,12 +9,15 @@ from numbers import Real
 
 
 STRATEGY_VERSION = "resonance-v0.1.0"
-DEPLOYMENT_BUILD_ID = "20260831.2"
+DEPLOYMENT_BUILD_ID = "20260901.1"
 FORMAL_EVENT_LOGIC_BUILD_ID = "20260827.3"
 ATR_EXIT_POLICY = "OBSERVE_ONLY"
 RELATIVE_BUY_POLICY = "EMPTY_SLOT_BACKFILL"
 NEW_BUY_VOLUME_POLICY = "T1_VOLUME_RATIO_SOFT_PRIORITY_WITH_FALLBACK"
 NEW_BUY_VOLUME_THRESHOLD = 1.0
+FORMAL_SELL_CONFIRMATION_POLICY = (
+    "BOLL_KDJ_ONLY_NEXT_SESSION_CONFIRMATION"
+)
 BENCHMARK = "000300.XSHG"
 
 
@@ -882,6 +885,7 @@ def initialize(context):
         "relative_buy_policy": RELATIVE_BUY_POLICY,
         "new_buy_volume_policy": NEW_BUY_VOLUME_POLICY,
         "new_buy_volume_threshold": NEW_BUY_VOLUME_THRESHOLD,
+        "formal_sell_confirmation_policy": FORMAL_SELL_CONFIRMATION_POLICY,
         "etf_pool": list(g.etf_pool),
     })
 
@@ -1129,6 +1133,50 @@ def make_position_state(buy_date, entry_atr, entry_price):
         "highest_close_anchor": float(entry_price),
         "pending_exit": None,
     }
+
+
+def is_boll_kdj_only_sell_decision(decision):
+    supporters = tuple(decision.get("supporters") or ())
+    return bool(
+        decision.get("direction") is TurnDirection.SELL_TURN
+        and decision.get("support_count") == 2
+        and frozenset(supporters) == frozenset(("BOLL", "KDJ"))
+    )
+
+
+def make_signal_exit_confirmation(decision, decision_date):
+    return {
+        "created_date": _calendar_date(decision_date),
+        "signal_date": _calendar_date(decision.get("signal_date")),
+        "resonance_id": decision.get("resonance_id"),
+        "supporters": tuple(decision.get("supporters") or ()),
+    }
+
+
+def is_signal_exit_confirmation_due(confirmation, decision_date):
+    created_date = _calendar_date(confirmation.get("created_date"))
+    normalized_decision_date = _calendar_date(decision_date)
+    if created_date is None or normalized_decision_date is None:
+        raise ValueError("signal exit confirmation date is invalid")
+    return created_date < normalized_decision_date
+
+
+def log_signal_exit_confirmation(code, action, confirmation, decision=None):
+    decision = dict(decision or {})
+    _emit_structured_log("signal_exit_confirmation", {
+        "build": DEPLOYMENT_BUILD_ID,
+        "policy": FORMAL_SELL_CONFIRMATION_POLICY,
+        "code": code,
+        "action": action,
+        "decision_date": getattr(g, "state_date", None),
+        "created_date": confirmation.get("created_date"),
+        "original_signal_date": confirmation.get("signal_date"),
+        "original_resonance_id": confirmation.get("resonance_id"),
+        "original_supporters": list(confirmation.get("supporters") or ()),
+        "current_signal_date": decision.get("signal_date"),
+        "current_resonance_id": decision.get("resonance_id"),
+        "current_supporters": list(decision.get("supporters") or ()),
+    })
 
 
 def set_pending_exit(position_state, reason, created_date, trigger_value,
@@ -2430,7 +2478,45 @@ def run_signal_exits(context, current_data, snapshots):
             if decision is not None:
                 log_resonance_decision(decision, False, "ATR_PENDING_PRIORITY")
             continue
+        confirmation = state.get("signal_exit_confirmation")
+        if confirmation is not None:
+            if is_signal_exit_confirmation_due(confirmation, decision_date):
+                state["signal_exit_confirmation"] = None
+                if decision is None:
+                    log_signal_exit_confirmation(
+                        code, "CANCELLED_NO_COMPLETE_SELL", confirmation,
+                    )
+                    continue
+                log_signal_exit_confirmation(
+                    code, "CONFIRMED", confirmation, decision,
+                )
+            elif (decision is not None
+                  and not is_boll_kdj_only_sell_decision(decision)):
+                state["signal_exit_confirmation"] = None
+                log_signal_exit_confirmation(
+                    code, "SUPERSEDED_BY_OTHER_COMPLETE_SELL",
+                    confirmation, decision,
+                )
+            else:
+                if decision is not None:
+                    log_resonance_decision(
+                        decision, False, "SIGNAL_EXIT_CONFIRMATION_WAITING",
+                    )
+                continue
         if decision is None:
+            continue
+        if (confirmation is None
+                and is_boll_kdj_only_sell_decision(decision)):
+            confirmation = make_signal_exit_confirmation(
+                decision, decision_date,
+            )
+            state["signal_exit_confirmation"] = confirmation
+            log_resonance_decision(
+                decision, False, "SIGNAL_EXIT_CONFIRMATION_STARTED",
+            )
+            log_signal_exit_confirmation(
+                code, "STARTED", confirmation, decision,
+            )
             continue
         snapshot = snapshots[code]
         if decision["resonance_id"] in g.processed_resonance_ids:
