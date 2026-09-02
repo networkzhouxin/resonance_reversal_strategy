@@ -3040,13 +3040,11 @@ def test_initialize_emits_version_and_separate_configuration_fingerprints(
     payload = json.loads(messages[-1])
     assert payload["event"] == "strategy_initialized"
     assert payload["version"] == strategy.STRATEGY_VERSION
-    assert payload["build"] == "20260902.1"
+    assert payload["build"] == "20260901.4"
     assert payload["atr_exit_policy"] == "OBSERVE_ONLY"
     assert payload["relative_buy_policy"] == "EMPTY_SLOT_BACKFILL"
     assert payload["relative_buy_priority_policy"] == "DMI_NEGATIVE_FIRST"
-    assert payload["formal_two_support_kdj_policy"] == (
-        "REQUIRE_GOLDEN_CROSS"
-    )
+    assert "formal_two_support_kdj_policy" not in payload
     assert "buy_execution_priority_policy" not in payload
     assert payload["parameter_fingerprint"]
     assert payload["pool_fingerprint"]
@@ -3202,7 +3200,7 @@ def test_buy_rejection_logs_third_indicator_conflict_and_stale_support(
     ]
 
 
-def test_formal_two_support_boll_kdj_buy_requires_origin_golden_cross(
+def test_formal_two_support_boll_kdj_buy_preserves_control_eligibility(
         monkeypatch):
     def buy_snapshot(code, rsi_direction, previous_diff, current_diff):
         book = event_book_for_directions(
@@ -3256,11 +3254,12 @@ def test_formal_two_support_boll_kdj_buy_requires_origin_golden_cross(
     decisions = strategy.collect_buy_decisions(snapshots, {})
 
     assert [decision["code"] for decision in decisions] == [
-        golden_cross_code, three_support_code, boll_rsi_code,
+        pre_cross_code, golden_cross_code, three_support_code, boll_rsi_code,
     ]
-    assert (
-        pre_cross_code, False, "KDJ_FORMAL_GOLDEN_CROSS_REQUIRED",
-    ) in reasons
+    assert not any(
+        code == pre_cross_code and accepted is False
+        for code, accepted, _ in reasons
+    )
 
 
 def test_empty_no_event_pool_emits_no_resonance_rejection_logs(monkeypatch):
@@ -3656,8 +3655,8 @@ def _event_diagnostic_frame(previous_overrides=None, current_overrides=None):
     )
 
 
-def test_kdj_golden_cross_candidate_build_id_is_20260902_1():
-    assert strategy.DEPLOYMENT_BUILD_ID == "20260902.1"
+def test_restored_control_build_id_is_20260901_4():
+    assert strategy.DEPLOYMENT_BUILD_ID == "20260901.4"
 
 
 def test_relative_observation_build_and_formal_fingerprints_are_separated(
@@ -3669,14 +3668,12 @@ def test_relative_observation_build_and_formal_fingerprints_are_separated(
     strategy.initialize(types.SimpleNamespace())
 
     payload = json.loads(messages[-1])
-    assert strategy.DEPLOYMENT_BUILD_ID == "20260902.1"
-    assert payload["build"] == "20260902.1"
+    assert strategy.DEPLOYMENT_BUILD_ID == "20260901.4"
+    assert payload["build"] == "20260901.4"
     assert payload["atr_exit_policy"] == "OBSERVE_ONLY"
     assert payload["relative_buy_policy"] == "EMPTY_SLOT_BACKFILL"
     assert payload["relative_buy_priority_policy"] == "DMI_NEGATIVE_FIRST"
-    assert payload["formal_two_support_kdj_policy"] == (
-        "REQUIRE_GOLDEN_CROSS"
-    )
+    assert "formal_two_support_kdj_policy" not in payload
     assert "buy_execution_priority_policy" not in payload
     assert payload["parameter_fingerprint"] == "e1227fbd8b4a884e"
     assert payload["pool_fingerprint"] == "9123995edeb1ed84"
