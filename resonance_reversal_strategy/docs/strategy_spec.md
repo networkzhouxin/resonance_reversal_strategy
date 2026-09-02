@@ -668,3 +668,45 @@ SELL：两指标和三指标的合法正式 SELL 共振均继续沿用既有卖�
 所有后续优化必须从本 build 派生，并遵守单变量、最小改动和预注册门槛。任何取消或
 放宽三指标新买入资格、恢复 ATR 实际退出、改变相对 BUY 补位或 DMI 排序的方案，均须
 先形成独立证据和中文实施计划，并再次取得用户明确同意。
+
+## 固定 3% 止盈候选（build 20260902.4）
+
+本候选直接派生自当前保留基线 `20260902.3`。唯一允许变化是新增一个独立卖出通道：
+T 日 09:35 的有效当前价相对实际持仓 `position.avg_cost` 的收益率达到或超过 `3%` 时，
+以 `TAKE_PROFIT_EXIT` 原因提交清仓。计算公式固定为：
+
+```text
+return_rate = current_data[code].last_price / position.avg_cost - 1
+triggered = return_rate >= 0.03
+```
+
+`last_price` 和 `avg_cost` 只用于持仓退出风控，不得进入 T-1 信号、共振、候选资格、排序
+或仓位公式。当前价或均价缺失、非有限值或不大于零时，该止盈通道不动作，原正式
+`SIGNAL_EXIT` 仍按既有流程判断。
+
+09:35 控制流固定为：
+
+```text
+retry_pending_exits
+  -> run_take_profit_exits
+  -> observe_atr_exit_conditions
+  -> build_signal_snapshots(T-1)
+  -> relative observation / candidate freeze
+  -> run_signal_exits
+  -> run_signal_buys
+```
+
+止盈一旦触发，即使停牌、部分成交或未成交，也冻结原始 `TAKE_PROFIT_EXIT` 和 3% 触发值；
+后续交易日先重试该退出，不因当时收益率回落而取消。止盈与正式 SELL 同日成立时只允许
+一笔卖单，止盈优先；实际归零后沿用 `sold_today`，禁止同日买回。下一交易日起若再次
+买入，必须重新经过既有 FORMAL/RELATIVE 买入流程。
+
+`EXIT_PRIORITY` 只处理已冻结退出原因，顺序为
+`SIGNAL_EXIT < TAKE_PROFIT_EXIT < ATR_EXIT`；ATR 仍为 `OBSERVE_ONLY`，不会新建实际
+ATR 退出。本候选不实现最长持有 5 个交易日，不搜索 2%、4% 等相邻止盈阈值，也不改变
+卖出共振有效期、买入规则、ETF 池、资金、摩擦或训练边界。
+
+build `20260902.4` 当前状态为 `CANDIDATE_AWAITING_JOINQUANT_REPLAY`。`.3` 仍是保留
+基线，候选只有在 2019—2021 普通摩擦 JoinQuant 真实路径中证明胜率提升，同时总收益、
+最大回撤、交易数量、年度稳定性、利润集中度、期末未平仓和日胜率没有不可接受恶化后，
+才能提交采用讨论。普通摩擦未通过则停止；双倍摩擦按用户决定暂缓，不得写成已通过。

@@ -31,8 +31,8 @@ EXPECTED_POOL = [
 ]
 
 
-def fake_position(amount):
-    return types.SimpleNamespace(total_amount=amount)
+def fake_position(amount, avg_cost=None):
+    return types.SimpleNamespace(total_amount=amount, avg_cost=avg_cost)
 
 
 def fake_context(previous_date="2021-01-05", current_date="2021-01-06",
@@ -1662,7 +1662,7 @@ def test_market_breadth_observation_log_contains_auditable_identity(
 
     payload = json.loads(messages[-1])
     assert payload["event"] == "market_breadth_observation"
-    assert payload["build"] == "20260902.3"
+    assert payload["build"] == "20260902.4"
     assert payload["parameter_fingerprint"] == "e1227fbd8b4a884e"
     assert payload["pool_fingerprint"] == "9123995edeb1ed84"
     assert payload["policy"] == (
@@ -1950,6 +1950,208 @@ def test_submit_sell_preserves_exit_reason_and_clears_only_actual_zero(
     assert orders == [(code, 0)]
     assert runtime.position_states == {}
     assert runtime.sold_today == {code}
+
+
+def test_take_profit_exit_triggers_at_exact_three_percent_and_marks_sold_today(
+        monkeypatch):
+    code = "510300.XSHG"
+    state = strategy.make_position_state(date(2021, 1, 4), 1.0, 10.0)
+    runtime = runtime_state(position_states={code: state})
+    positions = {code: fake_position(100, avg_cost=10.0)}
+    context = fake_context(positions=positions)
+    current_data = {code: current_record(10.3)}
+    orders = []
+
+    def filled_sell(order_code, target_amount):
+        orders.append((order_code, target_amount))
+        positions.pop(code)
+        return types.SimpleNamespace(amount=-100, filled=-100)
+
+    monkeypatch.setattr(strategy, "g", runtime, raising=False)
+    monkeypatch.setattr(
+        strategy, "get_current_data", lambda: current_data, raising=False,
+    )
+    monkeypatch.setattr(strategy, "order_target", filled_sell, raising=False)
+
+    attempted = strategy.run_take_profit_exits(context, current_data)
+
+    assert attempted == {code}
+    assert orders == [(code, 0)]
+    assert runtime.position_states == {}
+    assert runtime.sold_today == {code}
+
+
+def test_take_profit_exit_below_three_percent_only_records_check(monkeypatch):
+    code = "510300.XSHG"
+    state = strategy.make_position_state(date(2021, 1, 4), 1.0, 10.0)
+    runtime = runtime_state(position_states={code: state})
+    context = fake_context(
+        positions={code: fake_position(100, avg_cost=10.0)},
+    )
+    current_data = {code: current_record(10.299)}
+    logs = []
+    monkeypatch.setattr(strategy, "g", runtime, raising=False)
+    monkeypatch.setattr(
+        strategy, "_emit_structured_log",
+        lambda event, payload: logs.append((event, payload)),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        strategy, "submit_sell",
+        lambda *args: pytest.fail("return below 3% must not submit a sell"),
+        raising=False,
+    )
+
+    attempted = strategy.run_take_profit_exits(context, current_data)
+
+    assert attempted == set()
+    assert logs == [("take_profit_check", {
+        "code": code,
+        "cost_basis": 10.0,
+        "current_price": 10.299,
+        "return_rate": pytest.approx(0.0299),
+        "threshold": 0.03,
+        "triggered": False,
+        "pending_exit": None,
+        "order_submitted": False,
+    })]
+
+
+@pytest.mark.parametrize("avg_cost", [None, 0.0, float("nan")])
+def test_invalid_average_cost_does_not_block_existing_signal_exit(
+        monkeypatch, avg_cost):
+    code = "510300.XSHG"
+    state = strategy.make_position_state(date(2021, 1, 4), 1.0, 10.0)
+    runtime = runtime_state(position_states={code: state})
+    context = fake_context(
+        positions={code: fake_position(100, avg_cost=avg_cost)},
+    )
+    current_data = {code: current_record(10.5)}
+    sell_calls = []
+    monkeypatch.setattr(strategy, "g", runtime, raising=False)
+    monkeypatch.setattr(
+        strategy, "submit_sell",
+        lambda context_arg, order_code, reason, trigger_value: sell_calls.append(
+            (order_code, reason, trigger_value)
+        ) or strategy.OrderOutcome.FILLED,
+        raising=False,
+    )
+
+    take_profit_attempts = strategy.run_take_profit_exits(
+        context, current_data,
+    )
+    signal_attempts = strategy.run_signal_exits(
+        context, current_data,
+        {code: resonance_snapshot(code, direction="SELL_TURN")},
+    )
+
+    assert take_profit_attempts == set()
+    assert signal_attempts == {code}
+    assert sell_calls == [(code, strategy.ExitReason.SIGNAL_EXIT, 10.0)]
+
+
+def test_unfilled_take_profit_freezes_reason_and_prevents_same_day_signal_order(
+        monkeypatch):
+    code = "510300.XSHG"
+    state = strategy.make_position_state(date(2021, 1, 4), 1.0, 10.0)
+    runtime = runtime_state(position_states={code: state})
+    positions = {code: fake_position(100, avg_cost=10.0)}
+    context = fake_context(positions=positions)
+    current_data = {code: current_record(10.3)}
+    orders = []
+    monkeypatch.setattr(strategy, "g", runtime, raising=False)
+    monkeypatch.setattr(
+        strategy, "get_current_data", lambda: current_data, raising=False,
+    )
+    monkeypatch.setattr(
+        strategy, "order_target",
+        lambda order_code, target_amount: orders.append(
+            (order_code, target_amount)
+        ) or types.SimpleNamespace(amount=-100, filled=0),
+        raising=False,
+    )
+
+    take_profit_attempts = strategy.run_take_profit_exits(
+        context, current_data,
+    )
+    signal_attempts = strategy.run_signal_exits(
+        context, current_data,
+        {code: resonance_snapshot(code, direction="SELL_TURN")},
+    )
+
+    assert take_profit_attempts == {code}
+    assert signal_attempts == set()
+    assert orders == [(code, 0)]
+    assert state["pending_exit"] == {
+        "created_date": date(2021, 1, 6),
+        "reason": strategy.ExitReason.TAKE_PROFIT_EXIT,
+        "trigger_value": pytest.approx(0.03),
+        "remaining_amount": 100,
+    }
+
+
+def test_pending_take_profit_retries_even_after_return_falls_below_threshold(
+        monkeypatch):
+    code = "510300.XSHG"
+    state = strategy.make_position_state(date(2021, 1, 4), 1.0, 10.0)
+    state["pending_exit"] = {
+        "created_date": date(2021, 1, 6),
+        "reason": strategy.ExitReason.TAKE_PROFIT_EXIT,
+        "trigger_value": 0.03,
+        "remaining_amount": 100,
+    }
+    runtime = runtime_state(position_states={code: state})
+    context = fake_context(
+        previous_date=date(2021, 1, 6),
+        current_date=date(2021, 1, 7),
+        positions={code: fake_position(100, avg_cost=10.0)},
+    )
+    dispatched = []
+    monkeypatch.setattr(strategy, "g", runtime, raising=False)
+    monkeypatch.setattr(
+        strategy, "submit_sell",
+        lambda context_arg, order_code, reason, trigger_value: dispatched.append(
+            (order_code, reason, trigger_value)
+        ) or strategy.OrderOutcome.NOT_FILLED,
+        raising=False,
+    )
+
+    results = strategy.retry_pending_exits(
+        context, {code: current_record(9.8)},
+    )
+    fresh_attempts = strategy.run_take_profit_exits(
+        context, {code: current_record(9.8)},
+    )
+
+    assert results == [(code, strategy.OrderOutcome.NOT_FILLED)]
+    assert fresh_attempts == set()
+    assert dispatched == [(
+        code, strategy.ExitReason.TAKE_PROFIT_EXIT, 0.03,
+    )]
+
+
+def test_take_profit_quote_future_data_error_is_rethrown_unchanged(monkeypatch):
+    class FutureDataError(RuntimeError):
+        pass
+
+    expected = FutureDataError("future current quote")
+
+    class HostileCurrentData(dict):
+        def __getitem__(self, code):
+            raise expected
+
+    code = "510300.XSHG"
+    state = strategy.make_position_state(date(2021, 1, 4), 1.0, 10.0)
+    runtime = runtime_state(position_states={code: state})
+    context = fake_context(
+        positions={code: fake_position(100, avg_cost=10.0)},
+    )
+    monkeypatch.setattr(strategy, "g", runtime, raising=False)
+
+    with pytest.raises(FutureDataError) as raised:
+        strategy.run_take_profit_exits(context, HostileCurrentData())
+
+    assert raised.value is expected
 
 
 def test_triggered_atr_condition_is_observation_only(monkeypatch):
@@ -3172,8 +3374,12 @@ def test_initialize_emits_version_and_separate_configuration_fingerprints(
     payload = json.loads(messages[-1])
     assert payload["event"] == "strategy_initialized"
     assert payload["version"] == strategy.STRATEGY_VERSION
-    assert payload["build"] == "20260902.3"
+    assert payload["build"] == "20260902.4"
     assert payload["atr_exit_policy"] == "OBSERVE_ONLY"
+    assert payload["take_profit_policy"] == (
+        "CURRENT_PRICE_VS_POSITION_AVG_COST"
+    )
+    assert payload["take_profit_rate"] == pytest.approx(0.03)
     assert payload["relative_buy_policy"] == "EMPTY_SLOT_BACKFILL"
     assert payload["relative_buy_priority_policy"] == "DMI_NEGATIVE_FIRST"
     assert payload["new_buy_support_policy"] == "REQUIRE_ALL_THREE_INDICATORS"
@@ -3804,8 +4010,8 @@ def _event_diagnostic_frame(previous_overrides=None, current_overrides=None):
     )
 
 
-def test_three_indicator_new_buy_candidate_build_id_is_20260902_3():
-    assert strategy.DEPLOYMENT_BUILD_ID == "20260902.3"
+def test_fixed_take_profit_candidate_build_id_is_20260902_4():
+    assert strategy.DEPLOYMENT_BUILD_ID == "20260902.4"
 
 
 def test_relative_observation_build_and_formal_fingerprints_are_separated(
@@ -3817,9 +4023,13 @@ def test_relative_observation_build_and_formal_fingerprints_are_separated(
     strategy.initialize(types.SimpleNamespace())
 
     payload = json.loads(messages[-1])
-    assert strategy.DEPLOYMENT_BUILD_ID == "20260902.3"
-    assert payload["build"] == "20260902.3"
+    assert strategy.DEPLOYMENT_BUILD_ID == "20260902.4"
+    assert payload["build"] == "20260902.4"
     assert payload["atr_exit_policy"] == "OBSERVE_ONLY"
+    assert payload["take_profit_policy"] == (
+        "CURRENT_PRICE_VS_POSITION_AVG_COST"
+    )
+    assert payload["take_profit_rate"] == pytest.approx(0.03)
     assert payload["relative_buy_policy"] == "EMPTY_SLOT_BACKFILL"
     assert payload["relative_buy_priority_policy"] == "DMI_NEGATIVE_FIRST"
     assert payload["new_buy_support_policy"] == "REQUIRE_ALL_THREE_INDICATORS"
@@ -3869,6 +4079,10 @@ def test_do_trading_runs_relative_stage_without_skipping_formal_pipeline(
         strategy, "retry_pending_exits", lambda *args: calls.append("retry"),
     )
     monkeypatch.setattr(
+        strategy, "run_take_profit_exits",
+        lambda *args: calls.append("take_profit"),
+    )
+    monkeypatch.setattr(
         strategy, "observe_atr_exit_conditions",
         lambda *args: calls.append("atr"),
     )
@@ -3889,7 +4103,10 @@ def test_do_trading_runs_relative_stage_without_skipping_formal_pipeline(
 
     strategy.do_trading(fake_context())
 
-    assert calls == ["retry", "atr", "snapshots", "relative", "exits", "buys"]
+    assert calls == [
+        "retry", "take_profit", "atr", "snapshots", "relative", "exits",
+        "buys",
+    ]
 
 
 def test_relative_buy_future_error_stops_before_formal_orders(monkeypatch):

@@ -9,9 +9,11 @@ from numbers import Real
 
 
 STRATEGY_VERSION = "resonance-v0.1.0"
-DEPLOYMENT_BUILD_ID = "20260902.3"
+DEPLOYMENT_BUILD_ID = "20260902.4"
 FORMAL_EVENT_LOGIC_BUILD_ID = "20260827.3"
 ATR_EXIT_POLICY = "OBSERVE_ONLY"
+TAKE_PROFIT_POLICY = "CURRENT_PRICE_VS_POSITION_AVG_COST"
+TAKE_PROFIT_RATE = 0.03
 RELATIVE_BUY_POLICY = "EMPTY_SLOT_BACKFILL"
 RELATIVE_BUY_PRIORITY_POLICY = "DMI_NEGATIVE_FIRST"
 NEW_BUY_SUPPORT_POLICY = "REQUIRE_ALL_THREE_INDICATORS"
@@ -42,6 +44,7 @@ class OrderSide(Enum):
 
 class ExitReason(Enum):
     ATR_EXIT = "ATR_EXIT"
+    TAKE_PROFIT_EXIT = "TAKE_PROFIT_EXIT"
     SIGNAL_EXIT = "SIGNAL_EXIT"
 
 
@@ -61,7 +64,8 @@ class OrderOutcome(Enum):
 
 EXIT_PRIORITY = {
     ExitReason.SIGNAL_EXIT: 1,
-    ExitReason.ATR_EXIT: 2,
+    ExitReason.TAKE_PROFIT_EXIT: 2,
+    ExitReason.ATR_EXIT: 3,
 }
 
 
@@ -807,6 +811,7 @@ def do_trading(context):
     reset_daily_state(decision_date, signal_date)
     current_data = get_current_data()
     retry_pending_exits(context, current_data)
+    run_take_profit_exits(context, current_data)
     observe_atr_exit_conditions(context, current_data)
     snapshots = build_signal_snapshots(
         signal_date, g.params, decision_date,
@@ -881,6 +886,8 @@ def initialize(context):
         ),
         "relative_observation_fingerprint": relative_observation_fingerprint(),
         "atr_exit_policy": ATR_EXIT_POLICY,
+        "take_profit_policy": TAKE_PROFIT_POLICY,
+        "take_profit_rate": TAKE_PROFIT_RATE,
         "relative_buy_policy": RELATIVE_BUY_POLICY,
         "relative_buy_priority_policy": RELATIVE_BUY_PRIORITY_POLICY,
         "new_buy_support_policy": NEW_BUY_SUPPORT_POLICY,
@@ -1256,6 +1263,53 @@ def retry_pending_exits(context, current_data):
         )
         results.append((code, outcome))
     return results
+
+
+def get_position_average_cost(position):
+    average_cost = getattr(position, "avg_cost", None)
+    if not is_finite_positive(average_cost):
+        return None
+    return float(average_cost)
+
+
+def run_take_profit_exits(context, current_data):
+    attempted = set()
+    retried_codes = getattr(g, "daily_retried_exits", set())
+    for code, position in get_actual_positions(context).items():
+        if code in g.sold_today or code in retried_codes:
+            continue
+        state = g.position_states.get(code)
+        if state is None or state.get("pending_exit") is not None:
+            continue
+        cost_basis = get_position_average_cost(position)
+        current_price = get_execution_price(current_data, code)
+        return_rate = None
+        if cost_basis is not None and current_price is not None:
+            return_rate = current_price / cost_basis - 1.0
+        triggered = bool(
+            return_rate is not None and return_rate >= TAKE_PROFIT_RATE
+        )
+        order_submitted = bool(
+            triggered
+            and get_tradability(current_data, code) is Tradability.TRADEABLE
+        )
+        _emit_structured_log("take_profit_check", {
+            "code": code,
+            "cost_basis": cost_basis,
+            "current_price": current_price,
+            "return_rate": return_rate,
+            "threshold": TAKE_PROFIT_RATE,
+            "triggered": triggered,
+            "pending_exit": state.get("pending_exit"),
+            "order_submitted": order_submitted,
+        })
+        if not triggered:
+            continue
+        submit_sell(
+            context, code, ExitReason.TAKE_PROFIT_EXIT, TAKE_PROFIT_RATE,
+        )
+        attempted.add(code)
+    return attempted
 
 
 def update_highest_close_anchor(position_state, closing_price):
@@ -2469,6 +2523,13 @@ def run_signal_exits(context, current_data, snapshots):
                 and pending_exit["reason"] is ExitReason.ATR_EXIT):
             if decision is not None:
                 log_resonance_decision(decision, False, "ATR_PENDING_PRIORITY")
+            continue
+        if (pending_exit is not None
+                and pending_exit["reason"] is ExitReason.TAKE_PROFIT_EXIT):
+            if decision is not None:
+                log_resonance_decision(
+                    decision, False, "TAKE_PROFIT_PENDING_PRIORITY",
+                )
             continue
         if decision is None:
             continue
