@@ -710,3 +710,45 @@ build `20260902.4` 当前状态为 `CANDIDATE_AWAITING_JOINQUANT_REPLAY`。`.3` 
 基线，候选只有在 2019—2021 普通摩擦 JoinQuant 真实路径中证明胜率提升，同时总收益、
 最大回撤、交易数量、年度稳定性、利润集中度、期末未平仓和日胜率没有不可接受恶化后，
 才能提交采用讨论。普通摩擦未通过则停止；双倍摩擦按用户决定暂缓，不得写成已通过。
+
+## 五交易日后亏损 3% 退出候选（build 20260902.5）
+
+本候选以未回测的 `.4` 为直接控制，只新增 `FIVE_SESSION_LOSS_EXIT`。买入成交日计为持仓
+交易日 1；此后每次 09:35 交易回调最多递增一次。持仓达到第 5 个交易日后，若有效当前价
+相对实际持仓 `position.avg_cost` 的收益率小于或等于 `-3%`，则提交清仓：
+
+```text
+eligible = holding_session_count >= 5
+return_rate = current_data[code].last_price / position.avg_cost - 1
+triggered = eligible and return_rate <= -0.03
+```
+
+`holding_session_count >= 5` 后资格永久有效；第 5 天未亏 3% 时继续持有，第 6 天及以后
+首次达到亏损 3% 仍须卖出。它不是最长持有期，持仓天数不得影响固定 3% 止盈、正式
+`SIGNAL_EXIT`、ATR 观察、买入资格、排序、仓位或清理路径。第 5 天前即使亏损超过 3%，
+也不得通过本通道卖出，但既有正式 SELL 仍可按原规则卖出。
+
+持仓交易日只由实际交易日的 09:35 回调推进，不调用未来交易日日历；同一日期重复调用
+不得重复计数。均价、当前价或计数状态无效时，新通道 fail closed，不阻断正式 SELL。
+
+控制流固定为：
+
+```text
+retry_pending_exits
+  -> run_take_profit_exits
+  -> run_five_session_loss_exits
+  -> observe_atr_exit_conditions
+  -> build_signal_snapshots(T-1)
+  -> relative observation / candidate freeze
+  -> run_signal_exits
+  -> run_signal_buys
+```
+
+亏损退出停牌、部分成交或未成交时冻结 `FIVE_SESSION_LOSS_EXIT` 和 `-3%` 触发值，后续
+交易日优先重试，不因亏损收窄而取消。同日正式 SELL 不得提交第二笔卖单；实际归零后沿用
+`sold_today` 禁止同日买回。3% 止盈在持仓任意交易日仍优先独立判断。
+
+build `20260902.5` 当前状态为 `CANDIDATE_AWAITING_JOINQUANT_REPLAY`。由于 `.4` 尚未
+回测，普通摩擦必须先回放 commit `6dc8671` 的 `.4`，再回放 `.5`；只有这样才能把新增
+亏损退出的真实路径影响与固定止盈影响分开。`.3` 仍是唯一保留基线，双倍摩擦继续为
+`DEFERRED_NOT_RUN`，验证期保持关闭。

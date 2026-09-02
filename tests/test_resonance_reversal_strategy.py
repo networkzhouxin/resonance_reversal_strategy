@@ -1075,6 +1075,8 @@ def test_partial_buy_establishes_frozen_risk_state_and_consumes_daily_attempt(
         "buy_date": "2021-01-05",
         "entry_atr": 2.5,
         "highest_close_anchor": 10.2,
+        "holding_session_count": 1,
+        "holding_session_date": date(2021, 1, 5),
         "pending_exit": None,
     }
 
@@ -1662,7 +1664,7 @@ def test_market_breadth_observation_log_contains_auditable_identity(
 
     payload = json.loads(messages[-1])
     assert payload["event"] == "market_breadth_observation"
-    assert payload["build"] == "20260902.4"
+    assert payload["build"] == "20260902.5"
     assert payload["parameter_fingerprint"] == "e1227fbd8b4a884e"
     assert payload["pool_fingerprint"] == "9123995edeb1ed84"
     assert payload["policy"] == (
@@ -1864,6 +1866,8 @@ def test_submit_buy_uses_current_account_values_and_actual_partial_fill(
         "buy_date": pd.Timestamp("2021-01-06").date(),
         "entry_atr": 2.5,
         "highest_close_anchor": 11.0,
+        "holding_session_count": 1,
+        "holding_session_date": date(2021, 1, 6),
         "pending_exit": None,
     }
 
@@ -2150,6 +2154,230 @@ def test_take_profit_quote_future_data_error_is_rethrown_unchanged(monkeypatch):
 
     with pytest.raises(FutureDataError) as raised:
         strategy.run_take_profit_exits(context, HostileCurrentData())
+
+    assert raised.value is expected
+
+
+def test_five_session_loss_exit_starts_on_fifth_holding_session(monkeypatch):
+    code = "510300.XSHG"
+    state = strategy.make_position_state(date(2021, 1, 4), 1.0, 10.0)
+    runtime = runtime_state(position_states={code: state})
+    positions = {code: fake_position(100, avg_cost=10.0)}
+    context = fake_context(
+        previous_date=date(2021, 1, 4),
+        current_date=date(2021, 1, 5),
+        positions=positions,
+    )
+    current_data = {code: current_record(9.7)}
+    orders = []
+    logs = []
+
+    def sell_on_fifth_session(order_code, target_amount):
+        orders.append((order_code, target_amount, context.current_dt.date()))
+        positions.pop(code)
+        return types.SimpleNamespace(amount=-100, filled=-100)
+
+    monkeypatch.setattr(strategy, "g", runtime, raising=False)
+    monkeypatch.setattr(
+        strategy, "get_current_data", lambda: current_data, raising=False,
+    )
+    monkeypatch.setattr(strategy, "order_target", sell_on_fifth_session, raising=False)
+    monkeypatch.setattr(
+        strategy, "_emit_structured_log",
+        lambda event, payload: logs.append((event, payload)),
+        raising=False,
+    )
+
+    for current_date in (
+            date(2021, 1, 5), date(2021, 1, 6), date(2021, 1, 7)):
+        context.current_dt = pd.Timestamp(current_date)
+        assert strategy.run_five_session_loss_exits(
+            context, current_data,
+        ) == set()
+
+    context.current_dt = pd.Timestamp(date(2021, 1, 8))
+    attempted = strategy.run_five_session_loss_exits(context, current_data)
+
+    assert attempted == {code}
+    assert orders == [(code, 0, date(2021, 1, 8))]
+    assert runtime.position_states == {}
+    assert runtime.sold_today == {code}
+    loss_check = next(
+        payload for event, payload in reversed(logs)
+        if event == "five_session_loss_check"
+    )
+    assert loss_check["holding_session_count"] == 5
+    assert loss_check["return_rate"] == pytest.approx(-0.03)
+    assert loss_check["triggered"] is True
+
+
+def test_five_session_loss_condition_remains_active_after_fifth_session(
+        monkeypatch):
+    code = "510300.XSHG"
+    state = strategy.make_position_state(date(2021, 1, 4), 1.0, 10.0)
+    state["holding_session_count"] = 5
+    state["holding_session_date"] = date(2021, 1, 8)
+    runtime = runtime_state(position_states={code: state})
+    positions = {code: fake_position(100, avg_cost=10.0)}
+    context = fake_context(
+        previous_date=date(2021, 1, 8),
+        current_date=date(2021, 1, 11),
+        positions=positions,
+    )
+    current_data = {code: current_record(9.7)}
+
+    def filled_sell(order_code, target_amount):
+        positions.pop(code)
+        return types.SimpleNamespace(amount=-100, filled=-100)
+
+    monkeypatch.setattr(strategy, "g", runtime, raising=False)
+    monkeypatch.setattr(
+        strategy, "get_current_data", lambda: current_data, raising=False,
+    )
+    monkeypatch.setattr(strategy, "order_target", filled_sell, raising=False)
+
+    attempted = strategy.run_five_session_loss_exits(context, current_data)
+
+    assert attempted == {code}
+    assert runtime.position_states == {}
+    assert runtime.sold_today == {code}
+
+
+def test_under_five_session_loss_does_not_block_existing_signal_exit(
+        monkeypatch):
+    code = "510300.XSHG"
+    state = strategy.make_position_state(date(2021, 1, 4), 1.0, 10.0)
+    runtime = runtime_state(position_states={code: state})
+    context = fake_context(
+        previous_date=date(2021, 1, 4),
+        current_date=date(2021, 1, 5),
+        positions={code: fake_position(100, avg_cost=10.0)},
+    )
+    current_data = {code: current_record(9.5)}
+    sell_calls = []
+    monkeypatch.setattr(strategy, "g", runtime, raising=False)
+    monkeypatch.setattr(
+        strategy, "submit_sell",
+        lambda context_arg, order_code, reason, trigger_value: sell_calls.append(
+            (order_code, reason, trigger_value)
+        ) or strategy.OrderOutcome.FILLED,
+        raising=False,
+    )
+
+    loss_attempts = strategy.run_five_session_loss_exits(
+        context, current_data,
+    )
+    signal_attempts = strategy.run_signal_exits(
+        context, current_data,
+        {code: resonance_snapshot(code, direction="SELL_TURN")},
+    )
+
+    assert loss_attempts == set()
+    assert signal_attempts == {code}
+    assert sell_calls == [(code, strategy.ExitReason.SIGNAL_EXIT, 10.0)]
+
+
+def test_unfilled_five_session_loss_prevents_same_day_signal_order(monkeypatch):
+    code = "510300.XSHG"
+    state = strategy.make_position_state(date(2021, 1, 4), 1.0, 10.0)
+    state["holding_session_count"] = 4
+    state["holding_session_date"] = date(2021, 1, 7)
+    runtime = runtime_state(position_states={code: state})
+    positions = {code: fake_position(100, avg_cost=10.0)}
+    context = fake_context(
+        previous_date=date(2021, 1, 7),
+        current_date=date(2021, 1, 8),
+        positions=positions,
+    )
+    current_data = {code: current_record(9.7)}
+    orders = []
+    monkeypatch.setattr(strategy, "g", runtime, raising=False)
+    monkeypatch.setattr(
+        strategy, "get_current_data", lambda: current_data, raising=False,
+    )
+    monkeypatch.setattr(
+        strategy, "order_target",
+        lambda order_code, target_amount: orders.append(
+            (order_code, target_amount)
+        ) or types.SimpleNamespace(amount=-100, filled=0),
+        raising=False,
+    )
+
+    loss_attempts = strategy.run_five_session_loss_exits(
+        context, current_data,
+    )
+    signal_attempts = strategy.run_signal_exits(
+        context, current_data,
+        {code: resonance_snapshot(code, direction="SELL_TURN")},
+    )
+
+    assert loss_attempts == {code}
+    assert signal_attempts == set()
+    assert orders == [(code, 0)]
+    assert state["pending_exit"] == {
+        "created_date": date(2021, 1, 8),
+        "reason": strategy.ExitReason.FIVE_SESSION_LOSS_EXIT,
+        "trigger_value": pytest.approx(-0.03),
+        "remaining_amount": 100,
+    }
+
+
+def test_holding_session_count_advances_once_without_calendar_lookup(
+        monkeypatch):
+    code = "510300.XSHG"
+    state = strategy.make_position_state(date(2021, 1, 4), 1.0, 10.0)
+    runtime = runtime_state(position_states={code: state})
+    context = fake_context(
+        previous_date=date(2021, 1, 4),
+        current_date=date(2021, 1, 5),
+        positions={code: fake_position(100, avg_cost=10.0)},
+    )
+    current_data = {code: current_record(9.9)}
+    monkeypatch.setattr(strategy, "g", runtime, raising=False)
+    monkeypatch.setattr(
+        strategy, "get_trade_days",
+        lambda **kwargs: pytest.fail("09:35 holding count must not query calendar"),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        strategy, "submit_sell",
+        lambda *args: pytest.fail("one-percent loss must not submit a sell"),
+        raising=False,
+    )
+
+    assert strategy.run_five_session_loss_exits(context, current_data) == set()
+    assert strategy.run_five_session_loss_exits(context, current_data) == set()
+
+    assert state["holding_session_count"] == 2
+    assert state["holding_session_date"] == date(2021, 1, 5)
+
+
+def test_five_session_loss_quote_future_data_error_is_rethrown(monkeypatch):
+    class FutureDataError(RuntimeError):
+        pass
+
+    expected = FutureDataError("future five-session quote")
+
+    class HostileCurrentData(dict):
+        def __getitem__(self, code):
+            raise expected
+
+    code = "510300.XSHG"
+    state = strategy.make_position_state(date(2021, 1, 4), 1.0, 10.0)
+    state["holding_session_count"] = 4
+    state["holding_session_date"] = date(2021, 1, 7)
+    runtime = runtime_state(position_states={code: state})
+    context = fake_context(
+        previous_date=date(2021, 1, 7),
+        current_date=date(2021, 1, 8),
+        positions={code: fake_position(100, avg_cost=10.0)},
+    )
+    monkeypatch.setattr(strategy, "g", runtime, raising=False)
+
+    with pytest.raises(FutureDataError) as raised:
+        strategy.run_five_session_loss_exits(
+            context, HostileCurrentData(),
+        )
 
     assert raised.value is expected
 
@@ -3374,12 +3602,17 @@ def test_initialize_emits_version_and_separate_configuration_fingerprints(
     payload = json.loads(messages[-1])
     assert payload["event"] == "strategy_initialized"
     assert payload["version"] == strategy.STRATEGY_VERSION
-    assert payload["build"] == "20260902.4"
+    assert payload["build"] == "20260902.5"
     assert payload["atr_exit_policy"] == "OBSERVE_ONLY"
     assert payload["take_profit_policy"] == (
         "CURRENT_PRICE_VS_POSITION_AVG_COST"
     )
     assert payload["take_profit_rate"] == pytest.approx(0.03)
+    assert payload["five_session_loss_exit_policy"] == (
+        "AT_LEAST_FIVE_SESSIONS_AND_LOSS_AT_LEAST_3PCT"
+    )
+    assert payload["five_session_loss_min_sessions"] == 5
+    assert payload["five_session_loss_rate"] == pytest.approx(-0.03)
     assert payload["relative_buy_policy"] == "EMPTY_SLOT_BACKFILL"
     assert payload["relative_buy_priority_policy"] == "DMI_NEGATIVE_FIRST"
     assert payload["new_buy_support_policy"] == "REQUIRE_ALL_THREE_INDICATORS"
@@ -4010,8 +4243,8 @@ def _event_diagnostic_frame(previous_overrides=None, current_overrides=None):
     )
 
 
-def test_fixed_take_profit_candidate_build_id_is_20260902_4():
-    assert strategy.DEPLOYMENT_BUILD_ID == "20260902.4"
+def test_five_session_loss_candidate_build_id_is_20260902_5():
+    assert strategy.DEPLOYMENT_BUILD_ID == "20260902.5"
 
 
 def test_relative_observation_build_and_formal_fingerprints_are_separated(
@@ -4023,13 +4256,18 @@ def test_relative_observation_build_and_formal_fingerprints_are_separated(
     strategy.initialize(types.SimpleNamespace())
 
     payload = json.loads(messages[-1])
-    assert strategy.DEPLOYMENT_BUILD_ID == "20260902.4"
-    assert payload["build"] == "20260902.4"
+    assert strategy.DEPLOYMENT_BUILD_ID == "20260902.5"
+    assert payload["build"] == "20260902.5"
     assert payload["atr_exit_policy"] == "OBSERVE_ONLY"
     assert payload["take_profit_policy"] == (
         "CURRENT_PRICE_VS_POSITION_AVG_COST"
     )
     assert payload["take_profit_rate"] == pytest.approx(0.03)
+    assert payload["five_session_loss_exit_policy"] == (
+        "AT_LEAST_FIVE_SESSIONS_AND_LOSS_AT_LEAST_3PCT"
+    )
+    assert payload["five_session_loss_min_sessions"] == 5
+    assert payload["five_session_loss_rate"] == pytest.approx(-0.03)
     assert payload["relative_buy_policy"] == "EMPTY_SLOT_BACKFILL"
     assert payload["relative_buy_priority_policy"] == "DMI_NEGATIVE_FIRST"
     assert payload["new_buy_support_policy"] == "REQUIRE_ALL_THREE_INDICATORS"
@@ -4083,6 +4321,10 @@ def test_do_trading_runs_relative_stage_without_skipping_formal_pipeline(
         lambda *args: calls.append("take_profit"),
     )
     monkeypatch.setattr(
+        strategy, "run_five_session_loss_exits",
+        lambda *args: calls.append("five_session_loss"),
+    )
+    monkeypatch.setattr(
         strategy, "observe_atr_exit_conditions",
         lambda *args: calls.append("atr"),
     )
@@ -4104,8 +4346,8 @@ def test_do_trading_runs_relative_stage_without_skipping_formal_pipeline(
     strategy.do_trading(fake_context())
 
     assert calls == [
-        "retry", "take_profit", "atr", "snapshots", "relative", "exits",
-        "buys",
+        "retry", "take_profit", "five_session_loss", "atr", "snapshots",
+        "relative", "exits", "buys",
     ]
 
 

@@ -9,11 +9,16 @@ from numbers import Real
 
 
 STRATEGY_VERSION = "resonance-v0.1.0"
-DEPLOYMENT_BUILD_ID = "20260902.4"
+DEPLOYMENT_BUILD_ID = "20260902.5"
 FORMAL_EVENT_LOGIC_BUILD_ID = "20260827.3"
 ATR_EXIT_POLICY = "OBSERVE_ONLY"
 TAKE_PROFIT_POLICY = "CURRENT_PRICE_VS_POSITION_AVG_COST"
 TAKE_PROFIT_RATE = 0.03
+FIVE_SESSION_LOSS_EXIT_POLICY = (
+    "AT_LEAST_FIVE_SESSIONS_AND_LOSS_AT_LEAST_3PCT"
+)
+FIVE_SESSION_LOSS_MIN_SESSIONS = 5
+FIVE_SESSION_LOSS_RATE = -0.03
 RELATIVE_BUY_POLICY = "EMPTY_SLOT_BACKFILL"
 RELATIVE_BUY_PRIORITY_POLICY = "DMI_NEGATIVE_FIRST"
 NEW_BUY_SUPPORT_POLICY = "REQUIRE_ALL_THREE_INDICATORS"
@@ -44,6 +49,7 @@ class OrderSide(Enum):
 
 class ExitReason(Enum):
     ATR_EXIT = "ATR_EXIT"
+    FIVE_SESSION_LOSS_EXIT = "FIVE_SESSION_LOSS_EXIT"
     TAKE_PROFIT_EXIT = "TAKE_PROFIT_EXIT"
     SIGNAL_EXIT = "SIGNAL_EXIT"
 
@@ -64,8 +70,9 @@ class OrderOutcome(Enum):
 
 EXIT_PRIORITY = {
     ExitReason.SIGNAL_EXIT: 1,
-    ExitReason.TAKE_PROFIT_EXIT: 2,
-    ExitReason.ATR_EXIT: 3,
+    ExitReason.FIVE_SESSION_LOSS_EXIT: 2,
+    ExitReason.TAKE_PROFIT_EXIT: 3,
+    ExitReason.ATR_EXIT: 4,
 }
 
 
@@ -812,6 +819,7 @@ def do_trading(context):
     current_data = get_current_data()
     retry_pending_exits(context, current_data)
     run_take_profit_exits(context, current_data)
+    run_five_session_loss_exits(context, current_data)
     observe_atr_exit_conditions(context, current_data)
     snapshots = build_signal_snapshots(
         signal_date, g.params, decision_date,
@@ -888,6 +896,9 @@ def initialize(context):
         "atr_exit_policy": ATR_EXIT_POLICY,
         "take_profit_policy": TAKE_PROFIT_POLICY,
         "take_profit_rate": TAKE_PROFIT_RATE,
+        "five_session_loss_exit_policy": FIVE_SESSION_LOSS_EXIT_POLICY,
+        "five_session_loss_min_sessions": FIVE_SESSION_LOSS_MIN_SESSIONS,
+        "five_session_loss_rate": FIVE_SESSION_LOSS_RATE,
         "relative_buy_policy": RELATIVE_BUY_POLICY,
         "relative_buy_priority_policy": RELATIVE_BUY_PRIORITY_POLICY,
         "new_buy_support_policy": NEW_BUY_SUPPORT_POLICY,
@@ -1140,6 +1151,8 @@ def make_position_state(buy_date, entry_atr, entry_price):
         "buy_date": buy_date,
         "entry_atr": float(entry_atr),
         "highest_close_anchor": float(entry_price),
+        "holding_session_count": 1,
+        "holding_session_date": _calendar_date(buy_date),
         "pending_exit": None,
     }
 
@@ -1307,6 +1320,78 @@ def run_take_profit_exits(context, current_data):
             continue
         submit_sell(
             context, code, ExitReason.TAKE_PROFIT_EXIT, TAKE_PROFIT_RATE,
+        )
+        attempted.add(code)
+    return attempted
+
+
+def advance_holding_session_count(position_state, decision_date):
+    decision_date = _calendar_date(decision_date)
+    counted_date = _calendar_date(position_state.get("holding_session_date"))
+    count = position_state.get("holding_session_count")
+    if (decision_date is None
+            or counted_date is None
+            or isinstance(count, bool)
+            or not isinstance(count, int)
+            or count < 1
+            or decision_date < counted_date):
+        return None
+    if decision_date > counted_date:
+        count += 1
+        position_state["holding_session_count"] = count
+        position_state["holding_session_date"] = decision_date
+    return count
+
+
+def run_five_session_loss_exits(context, current_data):
+    attempted = set()
+    decision_date = context.current_dt.date()
+    retried_codes = getattr(g, "daily_retried_exits", set())
+    for code, position in get_actual_positions(context).items():
+        if code in g.sold_today or code in retried_codes:
+            continue
+        state = g.position_states.get(code)
+        if state is None or state.get("pending_exit") is not None:
+            continue
+        holding_session_count = advance_holding_session_count(
+            state, decision_date,
+        )
+        cost_basis = get_position_average_cost(position)
+        current_price = get_execution_price(current_data, code)
+        return_rate = None
+        if cost_basis is not None and current_price is not None:
+            return_rate = current_price / cost_basis - 1.0
+        eligible = bool(
+            holding_session_count is not None
+            and holding_session_count >= FIVE_SESSION_LOSS_MIN_SESSIONS
+        )
+        triggered = bool(
+            eligible
+            and return_rate is not None
+            and return_rate <= FIVE_SESSION_LOSS_RATE
+        )
+        order_submitted = bool(
+            triggered
+            and get_tradability(current_data, code) is Tradability.TRADEABLE
+        )
+        _emit_structured_log("five_session_loss_check", {
+            "code": code,
+            "holding_session_count": holding_session_count,
+            "minimum_holding_sessions": FIVE_SESSION_LOSS_MIN_SESSIONS,
+            "cost_basis": cost_basis,
+            "current_price": current_price,
+            "return_rate": return_rate,
+            "loss_threshold": FIVE_SESSION_LOSS_RATE,
+            "eligible": eligible,
+            "triggered": triggered,
+            "pending_exit": state.get("pending_exit"),
+            "order_submitted": order_submitted,
+        })
+        if not triggered:
+            continue
+        submit_sell(
+            context, code, ExitReason.FIVE_SESSION_LOSS_EXIT,
+            FIVE_SESSION_LOSS_RATE,
         )
         attempted.add(code)
     return attempted
@@ -2529,6 +2614,14 @@ def run_signal_exits(context, current_data, snapshots):
             if decision is not None:
                 log_resonance_decision(
                     decision, False, "TAKE_PROFIT_PENDING_PRIORITY",
+                )
+            continue
+        if (pending_exit is not None
+                and pending_exit["reason"]
+                is ExitReason.FIVE_SESSION_LOSS_EXIT):
+            if decision is not None:
+                log_resonance_decision(
+                    decision, False, "FIVE_SESSION_LOSS_PENDING_PRIORITY",
                 )
             continue
         if decision is None:
