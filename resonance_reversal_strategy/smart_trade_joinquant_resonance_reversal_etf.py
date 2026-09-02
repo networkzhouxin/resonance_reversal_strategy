@@ -9,11 +9,12 @@ from numbers import Real
 
 
 STRATEGY_VERSION = "resonance-v0.1.0"
-DEPLOYMENT_BUILD_ID = "20260901.4"
+DEPLOYMENT_BUILD_ID = "20260902.1"
 FORMAL_EVENT_LOGIC_BUILD_ID = "20260827.3"
 ATR_EXIT_POLICY = "OBSERVE_ONLY"
 RELATIVE_BUY_POLICY = "EMPTY_SLOT_BACKFILL"
 RELATIVE_BUY_PRIORITY_POLICY = "DMI_NEGATIVE_FIRST"
+FORMAL_TWO_SUPPORT_KDJ_POLICY = "REQUIRE_GOLDEN_CROSS"
 BENCHMARK = "000300.XSHG"
 
 
@@ -874,6 +875,7 @@ def initialize(context):
         "atr_exit_policy": ATR_EXIT_POLICY,
         "relative_buy_policy": RELATIVE_BUY_POLICY,
         "relative_buy_priority_policy": RELATIVE_BUY_PRIORITY_POLICY,
+        "formal_two_support_kdj_policy": FORMAL_TWO_SUPPORT_KDJ_POLICY,
         "etf_pool": list(g.etf_pool),
     })
 
@@ -2287,6 +2289,34 @@ def collect_complete_resonance_decisions(snapshots, direction):
     return decisions
 
 
+def _is_formal_two_support_boll_kdj_buy(decision):
+    return (
+        decision.get("direction") is TurnDirection.BUY_TURN
+        and decision.get("support_count") == 2
+        and frozenset(decision.get("supporters") or ()) == frozenset((
+            "BOLL", "KDJ",
+        ))
+    )
+
+
+def _origin_kdj_event_has_formal_golden_cross(snapshot):
+    event_book = snapshot.get("event_book") or empty_event_book()
+    event = (event_book.get("active") or {}).get("KDJ")
+    if (event is None
+            or event.get("direction") is not TurnDirection.BUY_TURN):
+        return False
+    trigger_values = event.get("trigger_values") or {}
+    previous = trigger_values.get("previous") or {}
+    current = trigger_values.get("current") or {}
+    previous_diff = _finite_float(previous.get("kd_diff"))
+    current_diff = _finite_float(current.get("kd_diff"))
+    return (
+        previous_diff is not None
+        and current_diff is not None
+        and previous_diff <= 0 < current_diff
+    )
+
+
 def collect_buy_decisions(snapshots, actual_positions):
     complete = collect_complete_resonance_decisions(
         snapshots, TurnDirection.BUY_TURN,
@@ -2295,6 +2325,14 @@ def collect_buy_decisions(snapshots, actual_positions):
     for code, decision in complete.items():
         if not is_finite_positive(snapshots[code].get("entry_atr")):
             log_resonance_decision(decision, False, "INVALID_ENTRY_ATR")
+            continue
+        if (_is_formal_two_support_boll_kdj_buy(decision)
+                and not _origin_kdj_event_has_formal_golden_cross(
+                    snapshots[code],
+                )):
+            log_resonance_decision(
+                decision, False, "KDJ_FORMAL_GOLDEN_CROSS_REQUIRED",
+            )
             continue
         decisions.append(decision)
     return decisions
