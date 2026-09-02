@@ -9,11 +9,13 @@ from numbers import Real
 
 
 STRATEGY_VERSION = "resonance-v0.1.0"
-DEPLOYMENT_BUILD_ID = "20260902.2"
+DEPLOYMENT_BUILD_ID = "20260902.3"
 FORMAL_EVENT_LOGIC_BUILD_ID = "20260827.3"
 ATR_EXIT_POLICY = "OBSERVE_ONLY"
 RELATIVE_BUY_POLICY = "EMPTY_SLOT_BACKFILL"
 RELATIVE_BUY_PRIORITY_POLICY = "DMI_NEGATIVE_FIRST"
+NEW_BUY_SUPPORT_POLICY = "REQUIRE_ALL_THREE_INDICATORS"
+NEW_BUY_REQUIRED_SUPPORT_COUNT = 3
 MARKET_BREADTH_OBSERVATION_POLICY = (
     "T1_POOL_CLOSE_AT_OR_ABOVE_BOLL_MID_MAJORITY"
 )
@@ -881,6 +883,8 @@ def initialize(context):
         "atr_exit_policy": ATR_EXIT_POLICY,
         "relative_buy_policy": RELATIVE_BUY_POLICY,
         "relative_buy_priority_policy": RELATIVE_BUY_PRIORITY_POLICY,
+        "new_buy_support_policy": NEW_BUY_SUPPORT_POLICY,
+        "new_buy_required_support_count": NEW_BUY_REQUIRED_SUPPORT_COUNT,
         "market_breadth_observation_policy": (
             MARKET_BREADTH_OBSERVATION_POLICY
         ),
@@ -2184,6 +2188,12 @@ def make_relative_buy_decision(observation):
     }
 
 
+def has_required_new_buy_support(decision):
+    return (
+        decision.get("support_count") == NEW_BUY_REQUIRED_SUPPORT_COUNT
+    )
+
+
 def collect_relative_buy_decisions(snapshots):
     decisions = []
     for observation in collect_relative_resonance_observations(snapshots):
@@ -2191,6 +2201,11 @@ def collect_relative_buy_decisions(snapshots):
         if decision is None:
             continue
         code = decision["code"]
+        if not has_required_new_buy_support(decision):
+            log_resonance_decision(
+                decision, False, "NEW_BUY_REQUIRES_THREE_SUPPORTERS",
+            )
+            continue
         if not is_finite_positive(snapshots[code].get("entry_atr")):
             log_resonance_decision(
                 decision, False, "RELATIVE_BUY_INVALID_ENTRY_ATR",
@@ -2371,6 +2386,11 @@ def collect_buy_decisions(snapshots, actual_positions):
     )
     decisions = []
     for code, decision in complete.items():
+        if not has_required_new_buy_support(decision):
+            log_resonance_decision(
+                decision, False, "NEW_BUY_REQUIRES_THREE_SUPPORTERS",
+            )
+            continue
         if not is_finite_positive(snapshots[code].get("entry_atr")):
             log_resonance_decision(decision, False, "INVALID_ENTRY_ATR")
             continue
