@@ -1525,6 +1525,10 @@ def test_do_trading_stage_order_has_no_broad_early_return(monkeypatch):
         lambda *args: order.append("signals") or {}, raising=False,
     )
     monkeypatch.setattr(
+        strategy, "log_market_breadth_observation",
+        lambda *args: order.append("market_breadth"), raising=False,
+    )
+    monkeypatch.setattr(
         strategy, "run_signal_exits",
         lambda *args: order.append("signal_sells"), raising=False,
     )
@@ -1538,8 +1542,136 @@ def test_do_trading_stage_order_has_no_broad_early_return(monkeypatch):
     strategy.do_trading(fake_context())
 
     assert order == [
-        "reset", "pending", "atr_observe", "signals", "signal_sells", "buys",
+        "reset", "pending", "atr_observe", "signals", "market_breadth",
+        "signal_sells", "buys",
     ]
+
+
+@pytest.mark.parametrize(
+    "snapshots,expected",
+    [
+        (
+            {
+                "above": {
+                    "valid": True, "close": 10.0,
+                    "trade_values": {"boll_mid": 9.0},
+                },
+                "equal": {
+                    "valid": True, "close": 8.0,
+                    "trade_values": {"boll_mid": 8.0},
+                },
+                "below": {
+                    "valid": True, "close": 7.0,
+                    "trade_values": {"boll_mid": 8.0},
+                },
+                "invalid": {
+                    "valid": False, "close": 100.0,
+                    "trade_values": {"boll_mid": 1.0},
+                },
+            },
+            {
+                "state": "RISK_ON", "status": "RECORDED",
+                "universe_count": 4, "valid_count": 3,
+                "at_or_above_count": 2, "below_count": 1,
+                "invalid_count": 1, "at_or_above_ratio": 2.0 / 3.0,
+            },
+        ),
+        (
+            {
+                "above": {
+                    "valid": True, "close": 10.0,
+                    "trade_values": {"boll_mid": 9.0},
+                },
+                "below_1": {
+                    "valid": True, "close": 7.0,
+                    "trade_values": {"boll_mid": 8.0},
+                },
+                "below_2": {
+                    "valid": True, "close": 6.0,
+                    "trade_values": {"boll_mid": 8.0},
+                },
+            },
+            {
+                "state": "RISK_OFF", "status": "RECORDED",
+                "universe_count": 3, "valid_count": 3,
+                "at_or_above_count": 1, "below_count": 2,
+                "invalid_count": 0, "at_or_above_ratio": 1.0 / 3.0,
+            },
+        ),
+        (
+            {
+                "invalid_flag": {
+                    "valid": False, "close": 10.0,
+                    "trade_values": {"boll_mid": 9.0},
+                },
+                "invalid_close": {
+                    "valid": True, "close": float("nan"),
+                    "trade_values": {"boll_mid": 9.0},
+                },
+                "invalid_mid": {
+                    "valid": True, "close": 10.0,
+                    "trade_values": {"boll_mid": None},
+                },
+            },
+            {
+                "state": "UNKNOWN", "status": "NO_VALID_SNAPSHOTS",
+                "universe_count": 3, "valid_count": 0,
+                "at_or_above_count": 0, "below_count": 0,
+                "invalid_count": 3, "at_or_above_ratio": None,
+            },
+        ),
+    ],
+)
+def test_market_breadth_observation_uses_only_valid_t1_snapshots(
+        snapshots, expected):
+    observation = strategy.build_market_breadth_observation(
+        snapshots, date(2021, 1, 11), date(2021, 1, 8),
+    )
+
+    assert observation == {
+        "decision_date": date(2021, 1, 11),
+        "signal_date": date(2021, 1, 8),
+        **expected,
+    }
+
+
+def test_market_breadth_observation_log_contains_auditable_identity(
+        monkeypatch):
+    messages = []
+    monkeypatch.setattr(
+        strategy, "log",
+        types.SimpleNamespace(info=lambda message: messages.append(message)),
+        raising=False,
+    )
+    monkeypatch.setattr(strategy, "g", runtime_state(), raising=False)
+
+    strategy.log_market_breadth_observation(
+        {
+            "above": {
+                "valid": True, "close": 10.0,
+                "trade_values": {"boll_mid": 9.0},
+            },
+            "below": {
+                "valid": True, "close": 7.0,
+                "trade_values": {"boll_mid": 8.0},
+            },
+        },
+        date(2021, 1, 11),
+        date(2021, 1, 8),
+    )
+
+    payload = json.loads(messages[-1])
+    assert payload["event"] == "market_breadth_observation"
+    assert payload["build"] == "20260902.2"
+    assert payload["parameter_fingerprint"] == "e1227fbd8b4a884e"
+    assert payload["pool_fingerprint"] == "9123995edeb1ed84"
+    assert payload["policy"] == (
+        "T1_POOL_CLOSE_AT_OR_ABOVE_BOLL_MID_MAJORITY"
+    )
+    assert payload["risk_on_minimum_ratio"] == 0.5
+    assert payload["state"] == "RISK_ON"
+    assert payload["valid_count"] == 2
+    assert payload["at_or_above_count"] == 1
 
 
 def test_atr_before_insufficient_signal_data_still_runs(monkeypatch):
@@ -3040,10 +3172,14 @@ def test_initialize_emits_version_and_separate_configuration_fingerprints(
     payload = json.loads(messages[-1])
     assert payload["event"] == "strategy_initialized"
     assert payload["version"] == strategy.STRATEGY_VERSION
-    assert payload["build"] == "20260901.4"
+    assert payload["build"] == "20260902.2"
     assert payload["atr_exit_policy"] == "OBSERVE_ONLY"
     assert payload["relative_buy_policy"] == "EMPTY_SLOT_BACKFILL"
     assert payload["relative_buy_priority_policy"] == "DMI_NEGATIVE_FIRST"
+    assert payload["market_breadth_observation_policy"] == (
+        "T1_POOL_CLOSE_AT_OR_ABOVE_BOLL_MID_MAJORITY"
+    )
+    assert payload["market_breadth_risk_on_minimum_ratio"] == 0.5
     assert "formal_two_support_kdj_policy" not in payload
     assert "buy_execution_priority_policy" not in payload
     assert payload["parameter_fingerprint"]
@@ -3655,8 +3791,8 @@ def _event_diagnostic_frame(previous_overrides=None, current_overrides=None):
     )
 
 
-def test_restored_control_build_id_is_20260901_4():
-    assert strategy.DEPLOYMENT_BUILD_ID == "20260901.4"
+def test_market_breadth_observation_build_id_is_20260902_2():
+    assert strategy.DEPLOYMENT_BUILD_ID == "20260902.2"
 
 
 def test_relative_observation_build_and_formal_fingerprints_are_separated(
@@ -3668,11 +3804,15 @@ def test_relative_observation_build_and_formal_fingerprints_are_separated(
     strategy.initialize(types.SimpleNamespace())
 
     payload = json.loads(messages[-1])
-    assert strategy.DEPLOYMENT_BUILD_ID == "20260901.4"
-    assert payload["build"] == "20260901.4"
+    assert strategy.DEPLOYMENT_BUILD_ID == "20260902.2"
+    assert payload["build"] == "20260902.2"
     assert payload["atr_exit_policy"] == "OBSERVE_ONLY"
     assert payload["relative_buy_policy"] == "EMPTY_SLOT_BACKFILL"
     assert payload["relative_buy_priority_policy"] == "DMI_NEGATIVE_FIRST"
+    assert payload["market_breadth_observation_policy"] == (
+        "T1_POOL_CLOSE_AT_OR_ABOVE_BOLL_MID_MAJORITY"
+    )
+    assert payload["market_breadth_risk_on_minimum_ratio"] == 0.5
     assert "formal_two_support_kdj_policy" not in payload
     assert "buy_execution_priority_policy" not in payload
     assert payload["parameter_fingerprint"] == "e1227fbd8b4a884e"
@@ -4623,7 +4763,11 @@ def test_do_trading_normalizes_ordinary_malformed_relative_books_before_formal_f
     strategy.do_trading(fake_context())
 
     assert calls == ["retry", "atr", "relative", "exits", "buys"]
-    assert diagnostics == [("relative_observation_snapshot", {
+    relative_diagnostics = [
+        item for item in diagnostics
+        if item[0] == "relative_observation_snapshot"
+    ]
+    assert relative_diagnostics == [("relative_observation_snapshot", {
         "code": code,
         "reason": "RELATIVE_EVENT_BOOK_INVALID",
         "error_type": error_type,
