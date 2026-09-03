@@ -103,6 +103,7 @@ def test_ensure_runtime_state_initializes_required_state(monkeypatch):
     assert runtime.observation_events == {}
     assert runtime.sold_today == set()
     assert runtime.daily_attempted_buys == set()
+    assert runtime.pending_relative_buy_confirmations == {}
 
 
 def test_do_trading_initializes_runtime_state(monkeypatch):
@@ -1275,6 +1276,7 @@ def runtime_state(max_holdings=3, position_states=None, processed=None,
         sold_today=set() if sold is None else sold,
         daily_attempted_buys=set() if attempted is None else attempted,
         daily_retried_exits=set() if retried is None else retried,
+        pending_relative_buy_confirmations={},
     )
 
 
@@ -1662,7 +1664,7 @@ def test_market_breadth_observation_log_contains_auditable_identity(
 
     payload = json.loads(messages[-1])
     assert payload["event"] == "market_breadth_observation"
-    assert payload["build"] == "20260902.3"
+    assert payload["build"] == "20260903.1"
     assert payload["parameter_fingerprint"] == "e1227fbd8b4a884e"
     assert payload["pool_fingerprint"] == "9123995edeb1ed84"
     assert payload["policy"] == (
@@ -3172,10 +3174,13 @@ def test_initialize_emits_version_and_separate_configuration_fingerprints(
     payload = json.loads(messages[-1])
     assert payload["event"] == "strategy_initialized"
     assert payload["version"] == strategy.STRATEGY_VERSION
-    assert payload["build"] == "20260902.3"
+    assert payload["build"] == "20260903.1"
     assert payload["atr_exit_policy"] == "OBSERVE_ONLY"
     assert payload["relative_buy_policy"] == "EMPTY_SLOT_BACKFILL"
     assert payload["relative_buy_priority_policy"] == "DMI_NEGATIVE_FIRST"
+    assert payload["relative_buy_confirmation_policy"] == (
+        "NEXT_SESSION_T1_CLOSE_ABOVE_SIGNAL_CLOSE"
+    )
     assert payload["new_buy_support_policy"] == "REQUIRE_ALL_THREE_INDICATORS"
     assert payload["new_buy_required_support_count"] == 3
     assert payload["market_breadth_observation_policy"] == (
@@ -3804,8 +3809,8 @@ def _event_diagnostic_frame(previous_overrides=None, current_overrides=None):
     )
 
 
-def test_three_indicator_new_buy_candidate_build_id_is_20260902_3():
-    assert strategy.DEPLOYMENT_BUILD_ID == "20260902.3"
+def test_relative_buy_follow_through_candidate_build_id_is_20260903_1():
+    assert strategy.DEPLOYMENT_BUILD_ID == "20260903.1"
 
 
 def test_relative_observation_build_and_formal_fingerprints_are_separated(
@@ -3817,11 +3822,14 @@ def test_relative_observation_build_and_formal_fingerprints_are_separated(
     strategy.initialize(types.SimpleNamespace())
 
     payload = json.loads(messages[-1])
-    assert strategy.DEPLOYMENT_BUILD_ID == "20260902.3"
-    assert payload["build"] == "20260902.3"
+    assert strategy.DEPLOYMENT_BUILD_ID == "20260903.1"
+    assert payload["build"] == "20260903.1"
     assert payload["atr_exit_policy"] == "OBSERVE_ONLY"
     assert payload["relative_buy_policy"] == "EMPTY_SLOT_BACKFILL"
     assert payload["relative_buy_priority_policy"] == "DMI_NEGATIVE_FIRST"
+    assert payload["relative_buy_confirmation_policy"] == (
+        "NEXT_SESSION_T1_CLOSE_ABOVE_SIGNAL_CLOSE"
+    )
     assert payload["new_buy_support_policy"] == "REQUIRE_ALL_THREE_INDICATORS"
     assert payload["new_buy_required_support_count"] == 3
     assert payload["market_breadth_observation_policy"] == (
@@ -3881,6 +3889,10 @@ def test_do_trading_runs_relative_stage_without_skipping_formal_pipeline(
         lambda snapshots: calls.append("relative"),
     )
     monkeypatch.setattr(
+        strategy, "prepare_confirmed_relative_buy_decisions",
+        lambda snapshots, signal_date: calls.append("confirm") or (),
+    )
+    monkeypatch.setattr(
         strategy, "run_signal_exits", lambda *args: calls.append("exits"),
     )
     monkeypatch.setattr(
@@ -3889,7 +3901,9 @@ def test_do_trading_runs_relative_stage_without_skipping_formal_pipeline(
 
     strategy.do_trading(fake_context())
 
-    assert calls == ["retry", "atr", "snapshots", "relative", "exits", "buys"]
+    assert calls == [
+        "retry", "atr", "snapshots", "relative", "confirm", "exits", "buys",
+    ]
 
 
 def test_relative_buy_future_error_stops_before_formal_orders(monkeypatch):
@@ -4277,6 +4291,223 @@ def test_relative_buy_backfills_only_after_formal_buy(
         (formal_code, strategy.OrderOutcome.FILLED),
         (relative_code, strategy.OrderOutcome.FILLED),
     ]
+
+
+def _relative_buy_signal_snapshot(code, signal_date="2021-01-05", close=10.0):
+    snapshot = resonance_snapshot(code, signal_date=signal_date)
+    snapshot["close"] = close
+    snapshot["event_book"] = strategy.empty_event_book()
+    snapshot["relative_event_book"] = relative_event_book_for_directions(
+        "BUY_TURN", "BUY_TURN", "BUY_TURN", signal_date,
+    )
+    snapshot["observation_values"] = {
+        "plus_di": 20.0, "minus_di": 30.0,
+    }
+    return snapshot
+
+
+def _relative_buy_confirmation_snapshot(
+        code, signal_date="2021-01-06", close=10.1, entry_atr=1.0,
+        plus_di=20.0, minus_di=30.0):
+    snapshot = resonance_snapshot(code, signal_date=signal_date)
+    snapshot["close"] = close
+    snapshot["entry_atr"] = entry_atr
+    snapshot["event_book"] = strategy.empty_event_book()
+    snapshot["relative_event_book"] = strategy.empty_event_book()
+    snapshot["observation_values"] = {
+        "plus_di": plus_di, "minus_di": minus_di,
+    }
+    return snapshot
+
+
+def test_relative_buy_waits_one_session_then_confirms_above_signal_close(
+        monkeypatch):
+    code = "510300.XSHG"
+    runtime = runtime_state()
+    reasons = []
+    monkeypatch.setattr(strategy, "g", runtime, raising=False)
+    monkeypatch.setattr(
+        strategy, "log_resonance_decision",
+        lambda decision, accepted, reason: reasons.append(
+            (decision["code"], accepted, reason)
+        ),
+        raising=False,
+    )
+
+    initial = strategy.prepare_confirmed_relative_buy_decisions(
+        {code: _relative_buy_signal_snapshot(code)}, date(2021, 1, 5),
+    )
+    confirmed = strategy.prepare_confirmed_relative_buy_decisions(
+        {code: _relative_buy_confirmation_snapshot(code)},
+        date(2021, 1, 6),
+    )
+
+    assert initial == ()
+    assert [item["code"] for item in confirmed] == [code]
+    assert confirmed[0]["signal_date"] == date(2021, 1, 5)
+    assert confirmed[0]["confirmation_signal_date"] == date(2021, 1, 6)
+    assert confirmed[0]["signal_close"] == pytest.approx(10.0)
+    assert confirmed[0]["confirmation_close"] == pytest.approx(10.1)
+    assert (code, False, "RELATIVE_BUY_AWAITING_FOLLOW_THROUGH") in reasons
+    assert (code, True, "RELATIVE_BUY_FOLLOW_THROUGH_CONFIRMED") in reasons
+
+
+@pytest.mark.parametrize("confirmation_close", [10.0, 9.9])
+def test_relative_buy_equal_or_lower_confirmation_close_cancels_candidate(
+        monkeypatch, confirmation_close):
+    code = "510300.XSHG"
+    runtime = runtime_state()
+    reasons = []
+    monkeypatch.setattr(strategy, "g", runtime, raising=False)
+    monkeypatch.setattr(
+        strategy, "log_resonance_decision",
+        lambda decision, accepted, reason: reasons.append(
+            (decision["code"], accepted, reason)
+        ),
+        raising=False,
+    )
+
+    strategy.prepare_confirmed_relative_buy_decisions(
+        {code: _relative_buy_signal_snapshot(code)}, date(2021, 1, 5),
+    )
+    rejected = strategy.prepare_confirmed_relative_buy_decisions(
+        {code: _relative_buy_confirmation_snapshot(
+            code, close=confirmation_close,
+        )},
+        date(2021, 1, 6),
+    )
+    later = strategy.prepare_confirmed_relative_buy_decisions(
+        {code: _relative_buy_confirmation_snapshot(
+            code, signal_date="2021-01-07", close=10.2,
+        )},
+        date(2021, 1, 7),
+    )
+
+    assert rejected == ()
+    assert later == ()
+    assert (code, False, "RELATIVE_BUY_FOLLOW_THROUGH_FAILED") in reasons
+
+
+def test_relative_buy_confirmation_keeps_existing_entry_atr_requirement(
+        monkeypatch):
+    code = "510300.XSHG"
+    runtime = runtime_state()
+    reasons = []
+    monkeypatch.setattr(strategy, "g", runtime, raising=False)
+    monkeypatch.setattr(
+        strategy, "log_resonance_decision",
+        lambda decision, accepted, reason: reasons.append(
+            (decision["code"], accepted, reason)
+        ),
+        raising=False,
+    )
+
+    strategy.prepare_confirmed_relative_buy_decisions(
+        {code: _relative_buy_signal_snapshot(code)}, date(2021, 1, 5),
+    )
+    confirmed = strategy.prepare_confirmed_relative_buy_decisions(
+        {code: _relative_buy_confirmation_snapshot(
+            code, close=10.1, entry_atr=None,
+        )},
+        date(2021, 1, 6),
+    )
+
+    assert confirmed == ()
+    assert (code, False, "RELATIVE_BUY_CONFIRMATION_INVALID_ENTRY_ATR") in reasons
+
+
+def test_relative_buy_confirmation_preserves_frozen_candidate_order(
+        monkeypatch):
+    first = "510300.XSHG"
+    second = "159915.XSHE"
+    runtime = runtime_state()
+    monkeypatch.setattr(strategy, "g", runtime, raising=False)
+    monkeypatch.setattr(
+        strategy, "log_resonance_decision", lambda *args: None,
+        raising=False,
+    )
+    first_signal = _relative_buy_signal_snapshot(first)
+    second_signal = _relative_buy_signal_snapshot(second)
+    second_signal["observation_values"] = {
+        "plus_di": 31.0, "minus_di": 30.0,
+    }
+
+    strategy.prepare_confirmed_relative_buy_decisions(
+        {second: second_signal, first: first_signal}, date(2021, 1, 5),
+    )
+    confirmations = {
+        first: _relative_buy_confirmation_snapshot(
+            first, plus_di=31.0, minus_di=30.0,
+        ),
+        second: _relative_buy_confirmation_snapshot(
+            second, plus_di=20.0, minus_di=30.0,
+        ),
+    }
+
+    confirmed = strategy.prepare_confirmed_relative_buy_decisions(
+        confirmations, date(2021, 1, 6),
+    )
+
+    assert [item["code"] for item in confirmed] == [first, second]
+
+
+def test_damaged_relative_buy_confirmation_fails_closed_without_exception(
+        monkeypatch):
+    code = "510300.XSHG"
+    runtime = runtime_state()
+    runtime.pending_relative_buy_confirmations = {code: {}}
+    diagnostics = []
+    monkeypatch.setattr(strategy, "g", runtime, raising=False)
+    monkeypatch.setattr(
+        strategy, "_safe_relative_observation_diagnostic",
+        lambda event, payload: diagnostics.append((event, payload)),
+        raising=False,
+    )
+
+    prepared = strategy.prepare_confirmed_relative_buy_decisions(
+        {code: _relative_buy_confirmation_snapshot(code)},
+        date(2021, 1, 6),
+    )
+
+    assert prepared == ()
+    assert runtime.pending_relative_buy_confirmations == {}
+    assert diagnostics[0][0] == "relative_buy_confirmation_pipeline"
+
+
+def test_relative_buy_confirmation_log_contains_both_t1_closes(monkeypatch):
+    messages = []
+    runtime = runtime_state()
+    runtime.state_date = date(2021, 1, 7)
+    monkeypatch.setattr(strategy, "g", runtime, raising=False)
+    monkeypatch.setattr(
+        strategy, "log",
+        types.SimpleNamespace(info=lambda message: messages.append(message)),
+        raising=False,
+    )
+
+    strategy.log_resonance_decision({
+        "code": "510300.XSHG",
+        "direction": strategy.TurnDirection.BUY_TURN,
+        "signal_date": date(2021, 1, 5),
+        "confirmation_signal_date": date(2021, 1, 6),
+        "signal_close": 10.0,
+        "confirmation_close": 10.1,
+    }, True, "RELATIVE_BUY_FOLLOW_THROUGH_CONFIRMED")
+
+    payload = json.loads(messages[-1])
+    assert payload["signal_close"] == pytest.approx(10.0)
+    assert payload["confirmation_signal_date"] == "2021-01-06"
+    assert payload["confirmation_close"] == pytest.approx(10.1)
+
+    strategy.log_resonance_decision({
+        "code": "510300.XSHG",
+        "direction": strategy.TurnDirection.SELL_TURN,
+        "signal_date": date(2021, 1, 6),
+    }, True, "COMPLETE_RESONANCE")
+    ordinary_payload = json.loads(messages[-1])
+    assert {
+        "signal_close", "confirmation_signal_date", "confirmation_close",
+    }.isdisjoint(ordinary_payload)
 
 
 def test_relative_buy_priority_prefers_negative_dmi_then_original_order(

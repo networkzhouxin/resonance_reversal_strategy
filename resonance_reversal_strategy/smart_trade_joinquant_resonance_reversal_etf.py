@@ -9,11 +9,14 @@ from numbers import Real
 
 
 STRATEGY_VERSION = "resonance-v0.1.0"
-DEPLOYMENT_BUILD_ID = "20260902.3"
+DEPLOYMENT_BUILD_ID = "20260903.1"
 FORMAL_EVENT_LOGIC_BUILD_ID = "20260827.3"
 ATR_EXIT_POLICY = "OBSERVE_ONLY"
 RELATIVE_BUY_POLICY = "EMPTY_SLOT_BACKFILL"
 RELATIVE_BUY_PRIORITY_POLICY = "DMI_NEGATIVE_FIRST"
+RELATIVE_BUY_CONFIRMATION_POLICY = (
+    "NEXT_SESSION_T1_CLOSE_ABOVE_SIGNAL_CLOSE"
+)
 NEW_BUY_SUPPORT_POLICY = "REQUIRE_ALL_THREE_INDICATORS"
 NEW_BUY_REQUIRED_SUPPORT_COUNT = 3
 MARKET_BREADTH_OBSERVATION_POLICY = (
@@ -270,7 +273,7 @@ def _event_detection_trace_requires_logging(trace):
 def log_resonance_decision(decision, accepted, reason):
     decision = dict(decision or {})
     runtime = globals().get("g")
-    _emit_structured_log("resonance_decision", {
+    payload = {
         "code": decision.get("code"),
         "direction": decision.get("direction"),
         "decision_date": getattr(runtime, "state_date", None),
@@ -282,7 +285,13 @@ def log_resonance_decision(decision, accepted, reason):
         "boll_age": decision.get("boll_age"),
         "resonance_id": decision.get("resonance_id"),
         "expires_date": decision.get("expires_date"),
-    })
+    }
+    for field in (
+            "signal_close", "confirmation_signal_date",
+            "confirmation_close"):
+        if field in decision:
+            payload[field] = decision[field]
+    _emit_structured_log("resonance_decision", payload)
 
 
 def log_order_transition(code, side, outcome, before_amount, after_amount,
@@ -798,6 +807,8 @@ def ensure_runtime_state():
         g.daily_attempted_buys = set()
     if not hasattr(g, "daily_retried_exits"):
         g.daily_retried_exits = set()
+    if not hasattr(g, "pending_relative_buy_confirmations"):
+        g.pending_relative_buy_confirmations = {}
 
 
 def do_trading(context):
@@ -831,7 +842,9 @@ def do_trading(context):
                 )):
             log_signal_snapshot(dict(snapshot, decision_date=decision_date))
     run_relative_observation_stage(snapshots)
-    relative_buy_decisions = prepare_relative_buy_decisions(snapshots)
+    relative_buy_decisions = prepare_confirmed_relative_buy_decisions(
+        snapshots, signal_date,
+    )
     run_signal_exits(context, current_data, snapshots)
     run_signal_buys(
         context, current_data, snapshots, relative_buy_decisions,
@@ -883,6 +896,9 @@ def initialize(context):
         "atr_exit_policy": ATR_EXIT_POLICY,
         "relative_buy_policy": RELATIVE_BUY_POLICY,
         "relative_buy_priority_policy": RELATIVE_BUY_PRIORITY_POLICY,
+        "relative_buy_confirmation_policy": (
+            RELATIVE_BUY_CONFIRMATION_POLICY
+        ),
         "new_buy_support_policy": NEW_BUY_SUPPORT_POLICY,
         "new_buy_required_support_count": NEW_BUY_REQUIRED_SUPPORT_COUNT,
         "market_breadth_observation_policy": (
@@ -2243,6 +2259,105 @@ def prepare_relative_buy_decisions(snapshots):
             raise
         _safe_relative_observation_diagnostic(
             "relative_buy_pipeline", {"error": str(error)},
+        )
+        return ()
+
+
+def _prepare_confirmed_relative_buy_decisions(snapshots, signal_date):
+    signal_date = _calendar_date(signal_date)
+    pending = g.pending_relative_buy_confirmations
+    fresh_decisions = prepare_relative_buy_decisions(snapshots)
+    confirmed = []
+    resolved_codes = set()
+
+    for code, record in list(pending.items()):
+        original_signal_date = _calendar_date(record.get("signal_date"))
+        if signal_date == original_signal_date:
+            continue
+        pending.pop(code, None)
+        resolved_codes.add(code)
+        decision = dict(record["decision"])
+        if (signal_date is None or original_signal_date is None
+                or signal_date < original_signal_date):
+            log_resonance_decision(
+                decision, False,
+                "RELATIVE_BUY_CONFIRMATION_DATE_REGRESSION",
+            )
+            continue
+        snapshot = snapshots.get(code) or {}
+        confirmation_close = _finite_float(snapshot.get("close"))
+        decision.update({
+            "signal_close": record["signal_close"],
+            "confirmation_signal_date": signal_date,
+            "confirmation_close": confirmation_close,
+        })
+        if not is_finite_positive(snapshot.get("entry_atr")):
+            log_resonance_decision(
+                decision, False,
+                "RELATIVE_BUY_CONFIRMATION_INVALID_ENTRY_ATR",
+            )
+            continue
+        if (snapshot.get("valid") is not True
+                or not is_finite_positive(confirmation_close)):
+            log_resonance_decision(
+                decision, False,
+                "RELATIVE_BUY_CONFIRMATION_INVALID_SNAPSHOT",
+            )
+            continue
+        if confirmation_close <= record["signal_close"]:
+            log_resonance_decision(
+                decision, False, "RELATIVE_BUY_FOLLOW_THROUGH_FAILED",
+            )
+            continue
+        log_resonance_decision(
+            decision, True, "RELATIVE_BUY_FOLLOW_THROUGH_CONFIRMED",
+        )
+        confirmed.append((record["priority"], decision))
+
+    for priority, decision in enumerate(fresh_decisions, start=1):
+        code = decision["code"]
+        if code in pending or code in resolved_codes:
+            continue
+        snapshot = snapshots.get(code) or {}
+        signal_close = _finite_float(snapshot.get("close"))
+        if not is_finite_positive(signal_close):
+            log_resonance_decision(
+                decision, False,
+                "RELATIVE_BUY_CONFIRMATION_INVALID_SIGNAL_CLOSE",
+            )
+            continue
+        pending[code] = {
+            "decision": dict(decision),
+            "signal_date": signal_date,
+            "signal_close": signal_close,
+            "priority": priority,
+        }
+        log_resonance_decision(
+            dict(decision, signal_close=signal_close),
+            False, "RELATIVE_BUY_AWAITING_FOLLOW_THROUGH",
+        )
+
+    return tuple(
+        decision for _, decision in sorted(
+            confirmed, key=lambda item: item[0],
+        )
+    )
+
+
+def prepare_confirmed_relative_buy_decisions(snapshots, signal_date):
+    try:
+        return _prepare_confirmed_relative_buy_decisions(
+            snapshots, signal_date,
+        )
+    except Exception as error:
+        if _is_future_data_error(error):
+            raise
+        g.pending_relative_buy_confirmations = {}
+        _safe_relative_observation_diagnostic(
+            "relative_buy_confirmation_pipeline", {
+                "reason": "RELATIVE_BUY_CONFIRMATION_STATE_DROPPED",
+                "error_type": type(error).__name__,
+            },
         )
         return ()
 
