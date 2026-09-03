@@ -24,11 +24,7 @@ strategy = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(strategy)
 
 
-EXPECTED_POOL = [
-    "510300.XSHG", "159915.XSHE", "512100.XSHG", "159928.XSHE",
-    "510880.XSHG", "513100.XSHG", "513500.XSHG", "159920.XSHE",
-    "513880.XSHG", "513050.XSHG", "518880.XSHG", "159985.XSHE",
-]
+EXPECTED_POOL = ["600900.XSHG"]
 
 
 def fake_position(amount):
@@ -88,6 +84,44 @@ def test_initialize_enables_future_guard_and_fixed_schedules(monkeypatch):
     assert ("benchmark", "000300.XSHG") in calls
     assert ("daily", "do_trading", "09:35") in calls
     assert ("daily", "after_close", "15:30") in calls
+
+
+def test_initialize_uses_stock_costs_for_changjiang_power_candidate(
+        monkeypatch):
+    calls = []
+    monkeypatch.setattr(strategy, "set_option", lambda *args: None, raising=False)
+    monkeypatch.setattr(strategy, "set_benchmark", lambda *args: None, raising=False)
+    monkeypatch.setattr(
+        strategy, "PriceRelatedSlippage",
+        lambda value: ("price_related", value), raising=False,
+    )
+    monkeypatch.setattr(
+        strategy, "set_slippage",
+        lambda value, type=None: calls.append(("slippage", value, type)),
+        raising=False,
+    )
+    monkeypatch.setattr(strategy, "OrderCost", lambda **kwargs: kwargs, raising=False)
+    monkeypatch.setattr(
+        strategy, "set_order_cost",
+        lambda value, type=None: calls.append(("cost", value, type)),
+        raising=False,
+    )
+    monkeypatch.setattr(strategy, "run_daily", lambda *args, **kwargs: None, raising=False)
+    monkeypatch.setattr(strategy, "log", types.SimpleNamespace(info=lambda *args: None), raising=False)
+    monkeypatch.setattr(strategy, "g", types.SimpleNamespace(), raising=False)
+
+    strategy.initialize(types.SimpleNamespace())
+
+    assert ("slippage", ("price_related", 0.001), "stock") in calls
+    cost_call = next(call for call in calls if call[0] == "cost")
+    assert cost_call == ("cost", {
+        "open_tax": 0,
+        "close_tax": 0.001,
+        "open_commission": 0.0003,
+        "close_commission": 0.0003,
+        "close_today_commission": 0,
+        "min_commission": 5,
+    }, "stock")
 
 
 def test_ensure_runtime_state_initializes_required_state(monkeypatch):
@@ -751,10 +785,10 @@ def test_relative_fingerprint_is_deterministic_and_formal_fingerprints_are_froze
     assert strategy._value_fingerprint(params) == "e1227fbd8b4a884e"
     assert strategy._value_fingerprint(
         strategy.get_default_etf_pool(),
-    ) == "9123995edeb1ed84"
+    ) == "50a76e58356faafd"
     assert strategy.business_config_fingerprint(
         params, strategy.get_default_etf_pool(),
-    ) == "88fdf95966ea0368"
+    ) == "ea5921fadb2ad493"
     assert strategy.event_logic_fingerprint(
         params, self_check,
     ) == "1c0b8a22f48c97c3"
@@ -1662,9 +1696,9 @@ def test_market_breadth_observation_log_contains_auditable_identity(
 
     payload = json.loads(messages[-1])
     assert payload["event"] == "market_breadth_observation"
-    assert payload["build"] == "20260902.3"
+    assert payload["build"] == "20260903.1"
     assert payload["parameter_fingerprint"] == "e1227fbd8b4a884e"
-    assert payload["pool_fingerprint"] == "9123995edeb1ed84"
+    assert payload["pool_fingerprint"] == "50a76e58356faafd"
     assert payload["policy"] == (
         "T1_POOL_CLOSE_AT_OR_ABOVE_BOLL_MID_MAJORITY"
     )
@@ -3172,7 +3206,7 @@ def test_initialize_emits_version_and_separate_configuration_fingerprints(
     payload = json.loads(messages[-1])
     assert payload["event"] == "strategy_initialized"
     assert payload["version"] == strategy.STRATEGY_VERSION
-    assert payload["build"] == "20260902.3"
+    assert payload["build"] == "20260903.1"
     assert payload["atr_exit_policy"] == "OBSERVE_ONLY"
     assert payload["relative_buy_policy"] == "EMPTY_SLOT_BACKFILL"
     assert payload["relative_buy_priority_policy"] == "DMI_NEGATIVE_FIRST"
@@ -3804,8 +3838,8 @@ def _event_diagnostic_frame(previous_overrides=None, current_overrides=None):
     )
 
 
-def test_three_indicator_new_buy_candidate_build_id_is_20260902_3():
-    assert strategy.DEPLOYMENT_BUILD_ID == "20260902.3"
+def test_changjiang_power_candidate_build_id_is_20260903_1():
+    assert strategy.DEPLOYMENT_BUILD_ID == "20260903.1"
 
 
 def test_relative_observation_build_and_formal_fingerprints_are_separated(
@@ -3817,8 +3851,8 @@ def test_relative_observation_build_and_formal_fingerprints_are_separated(
     strategy.initialize(types.SimpleNamespace())
 
     payload = json.loads(messages[-1])
-    assert strategy.DEPLOYMENT_BUILD_ID == "20260902.3"
-    assert payload["build"] == "20260902.3"
+    assert strategy.DEPLOYMENT_BUILD_ID == "20260903.1"
+    assert payload["build"] == "20260903.1"
     assert payload["atr_exit_policy"] == "OBSERVE_ONLY"
     assert payload["relative_buy_policy"] == "EMPTY_SLOT_BACKFILL"
     assert payload["relative_buy_priority_policy"] == "DMI_NEGATIVE_FIRST"
@@ -3831,7 +3865,7 @@ def test_relative_observation_build_and_formal_fingerprints_are_separated(
     assert "formal_two_support_kdj_policy" not in payload
     assert "buy_execution_priority_policy" not in payload
     assert payload["parameter_fingerprint"] == "e1227fbd8b4a884e"
-    assert payload["pool_fingerprint"] == "9123995edeb1ed84"
+    assert payload["pool_fingerprint"] == "50a76e58356faafd"
     assert payload["event_logic_fingerprint"] == "1c0b8a22f48c97c3"
     assert payload["relative_observation_fingerprint"] == (
         strategy.relative_observation_fingerprint()

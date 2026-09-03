@@ -9,7 +9,7 @@ from numbers import Real
 
 
 STRATEGY_VERSION = "resonance-v0.1.0"
-DEPLOYMENT_BUILD_ID = "20260902.3"
+DEPLOYMENT_BUILD_ID = "20260903.1"
 FORMAL_EVENT_LOGIC_BUILD_ID = "20260827.3"
 ATR_EXIT_POLICY = "OBSERVE_ONLY"
 RELATIVE_BUY_POLICY = "EMPTY_SLOT_BACKFILL"
@@ -82,11 +82,7 @@ def classify_order_outcome(side, before_amount, after_amount, target_amount,
 
 
 def get_default_etf_pool():
-    return [
-        "510300.XSHG", "159915.XSHE", "512100.XSHG", "159928.XSHE",
-        "510880.XSHG", "513100.XSHG", "513500.XSHG", "159920.XSHE",
-        "513880.XSHG", "513050.XSHG", "518880.XSHG", "159985.XSHE",
-    ]
+    return ["600900.XSHG"]
 
 
 def get_default_params():
@@ -857,15 +853,15 @@ def initialize(context):
     set_option("use_real_price", True)
     set_option("avoid_future_data", True)
     set_benchmark(BENCHMARK)
-    set_slippage(PriceRelatedSlippage(0.001), type="fund")
+    set_slippage(PriceRelatedSlippage(0.001), type="stock")
     set_order_cost(OrderCost(
         open_tax=0,
-        close_tax=0,
+        close_tax=0.001,
         open_commission=0.0003,
         close_commission=0.0003,
         close_today_commission=0,
         min_commission=5,
-    ), type="fund")
+    ), type="stock")
     run_daily(do_trading, time="09:35", reference_security=BENCHMARK)
     run_daily(after_close, time="15:30", reference_security=BENCHMARK)
     ensure_runtime_state()
