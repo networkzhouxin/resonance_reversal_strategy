@@ -9,10 +9,17 @@ from numbers import Real
 
 
 STRATEGY_VERSION = "resonance-v0.1.0"
-DEPLOYMENT_BUILD_ID = "20260828.5"
+DEPLOYMENT_BUILD_ID = "20260902.3"
 FORMAL_EVENT_LOGIC_BUILD_ID = "20260827.3"
 ATR_EXIT_POLICY = "OBSERVE_ONLY"
 RELATIVE_BUY_POLICY = "EMPTY_SLOT_BACKFILL"
+RELATIVE_BUY_PRIORITY_POLICY = "DMI_NEGATIVE_FIRST"
+NEW_BUY_SUPPORT_POLICY = "REQUIRE_ALL_THREE_INDICATORS"
+NEW_BUY_REQUIRED_SUPPORT_COUNT = 3
+MARKET_BREADTH_OBSERVATION_POLICY = (
+    "T1_POOL_CLOSE_AT_OR_ABOVE_BOLL_MID_MAJORITY"
+)
+MARKET_BREADTH_RISK_ON_MINIMUM_RATIO = 0.5
 BENCHMARK = "000300.XSHG"
 
 
@@ -804,6 +811,9 @@ def do_trading(context):
     snapshots = build_signal_snapshots(
         signal_date, g.params, decision_date,
     )
+    log_market_breadth_observation(
+        snapshots, decision_date, signal_date,
+    )
     held_codes = set(get_actual_positions(context))
     for snapshot in snapshots.values():
         event_book = snapshot.get("event_book") or {}
@@ -872,6 +882,15 @@ def initialize(context):
         "relative_observation_fingerprint": relative_observation_fingerprint(),
         "atr_exit_policy": ATR_EXIT_POLICY,
         "relative_buy_policy": RELATIVE_BUY_POLICY,
+        "relative_buy_priority_policy": RELATIVE_BUY_PRIORITY_POLICY,
+        "new_buy_support_policy": NEW_BUY_SUPPORT_POLICY,
+        "new_buy_required_support_count": NEW_BUY_REQUIRED_SUPPORT_COUNT,
+        "market_breadth_observation_policy": (
+            MARKET_BREADTH_OBSERVATION_POLICY
+        ),
+        "market_breadth_risk_on_minimum_ratio": (
+            MARKET_BREADTH_RISK_ON_MINIMUM_RATIO
+        ),
         "etf_pool": list(g.etf_pool),
     })
 
@@ -973,6 +992,71 @@ def build_signal_snapshots(prev_date, params, decision_date):
             code, signal_date, params, decision_date,
         )
     return snapshots
+
+
+def build_market_breadth_observation(
+        snapshots, decision_date, signal_date):
+    snapshot_map = snapshots if isinstance(snapshots, dict) else {}
+    universe_count = len(snapshot_map)
+    at_or_above_count = 0
+    valid_count = 0
+    for snapshot in snapshot_map.values():
+        if not isinstance(snapshot, dict) or snapshot.get("valid") is not True:
+            continue
+        trade_values = snapshot.get("trade_values")
+        if not isinstance(trade_values, dict):
+            continue
+        close = snapshot.get("close")
+        boll_mid = trade_values.get("boll_mid")
+        if not is_finite_positive(close) or not is_finite_positive(boll_mid):
+            continue
+        valid_count += 1
+        if float(close) >= float(boll_mid):
+            at_or_above_count += 1
+    below_count = valid_count - at_or_above_count
+    invalid_count = universe_count - valid_count
+    if valid_count == 0:
+        state = "UNKNOWN"
+        status = "NO_VALID_SNAPSHOTS"
+        ratio = None
+    else:
+        ratio = float(at_or_above_count) / valid_count
+        state = (
+            "RISK_ON"
+            if ratio >= MARKET_BREADTH_RISK_ON_MINIMUM_RATIO
+            else "RISK_OFF"
+        )
+        status = "RECORDED"
+    return {
+        "decision_date": _calendar_date(decision_date),
+        "signal_date": _calendar_date(signal_date),
+        "state": state,
+        "status": status,
+        "universe_count": universe_count,
+        "valid_count": valid_count,
+        "at_or_above_count": at_or_above_count,
+        "below_count": below_count,
+        "invalid_count": invalid_count,
+        "at_or_above_ratio": ratio,
+    }
+
+
+def log_market_breadth_observation(
+        snapshots, decision_date, signal_date):
+    params, etf_pool = _runtime_params_and_pool()
+    observation = build_market_breadth_observation(
+        snapshots, decision_date, signal_date,
+    )
+    _emit_structured_log("market_breadth_observation", {
+        "version": STRATEGY_VERSION,
+        "build": DEPLOYMENT_BUILD_ID,
+        "parameter_fingerprint": _value_fingerprint(params),
+        "pool_fingerprint": _value_fingerprint(etf_pool),
+        "policy": MARKET_BREADTH_OBSERVATION_POLICY,
+        "risk_on_minimum_ratio": MARKET_BREADTH_RISK_ON_MINIMUM_RATIO,
+        **observation,
+    })
+    return observation
 
 
 def calc_buy_target_value(total_value, available_cash, params):
@@ -2104,6 +2188,12 @@ def make_relative_buy_decision(observation):
     }
 
 
+def has_required_new_buy_support(decision):
+    return (
+        decision.get("support_count") == NEW_BUY_REQUIRED_SUPPORT_COUNT
+    )
+
+
 def collect_relative_buy_decisions(snapshots):
     decisions = []
     for observation in collect_relative_resonance_observations(snapshots):
@@ -2111,6 +2201,11 @@ def collect_relative_buy_decisions(snapshots):
         if decision is None:
             continue
         code = decision["code"]
+        if not has_required_new_buy_support(decision):
+            log_resonance_decision(
+                decision, False, "NEW_BUY_REQUIRES_THREE_SUPPORTERS",
+            )
+            continue
         if not is_finite_positive(snapshots[code].get("entry_atr")):
             log_resonance_decision(
                 decision, False, "RELATIVE_BUY_INVALID_ENTRY_ATR",
@@ -2120,10 +2215,28 @@ def collect_relative_buy_decisions(snapshots):
     return decisions
 
 
+def relative_buy_dmi_priority(snapshot):
+    observation_values = snapshot.get("observation_values") or {}
+    plus_di = _finite_float(observation_values.get("plus_di"))
+    minus_di = _finite_float(observation_values.get("minus_di"))
+    return int(not (
+        plus_di is not None
+        and minus_di is not None
+        and plus_di < minus_di
+    ))
+
+
+def sort_relative_buy_decisions(decisions, snapshots):
+    original_order = sort_buy_decisions(decisions)
+    return sorted(original_order, key=lambda item: relative_buy_dmi_priority(
+        snapshots.get(item["code"]) or {},
+    ))
+
+
 def prepare_relative_buy_decisions(snapshots):
     try:
-        return tuple(sort_buy_decisions(
-            collect_relative_buy_decisions(snapshots)
+        return tuple(sort_relative_buy_decisions(
+            collect_relative_buy_decisions(snapshots), snapshots,
         ))
     except Exception as error:
         if _is_future_data_error(error):
@@ -2273,6 +2386,11 @@ def collect_buy_decisions(snapshots, actual_positions):
     )
     decisions = []
     for code, decision in complete.items():
+        if not has_required_new_buy_support(decision):
+            log_resonance_decision(
+                decision, False, "NEW_BUY_REQUIRES_THREE_SUPPORTERS",
+            )
+            continue
         if not is_finite_positive(snapshots[code].get("entry_atr")):
             log_resonance_decision(decision, False, "INVALID_ENTRY_ATR")
             continue

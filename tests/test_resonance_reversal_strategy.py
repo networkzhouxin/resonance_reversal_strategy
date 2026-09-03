@@ -1245,7 +1245,7 @@ def test_flat_position_clears_only_its_risk_state(monkeypatch):
 
 
 def resonance_snapshot(code, direction="BUY_TURN", signal_date="2021-01-05",
-                       support_count=2):
+                       support_count=3):
     kdj = direction if support_count == 3 else "NEUTRAL"
     book = event_book_for_directions(
         direction, direction, kdj, signal_date,
@@ -1525,6 +1525,10 @@ def test_do_trading_stage_order_has_no_broad_early_return(monkeypatch):
         lambda *args: order.append("signals") or {}, raising=False,
     )
     monkeypatch.setattr(
+        strategy, "log_market_breadth_observation",
+        lambda *args: order.append("market_breadth"), raising=False,
+    )
+    monkeypatch.setattr(
         strategy, "run_signal_exits",
         lambda *args: order.append("signal_sells"), raising=False,
     )
@@ -1538,8 +1542,136 @@ def test_do_trading_stage_order_has_no_broad_early_return(monkeypatch):
     strategy.do_trading(fake_context())
 
     assert order == [
-        "reset", "pending", "atr_observe", "signals", "signal_sells", "buys",
+        "reset", "pending", "atr_observe", "signals", "market_breadth",
+        "signal_sells", "buys",
     ]
+
+
+@pytest.mark.parametrize(
+    "snapshots,expected",
+    [
+        (
+            {
+                "above": {
+                    "valid": True, "close": 10.0,
+                    "trade_values": {"boll_mid": 9.0},
+                },
+                "equal": {
+                    "valid": True, "close": 8.0,
+                    "trade_values": {"boll_mid": 8.0},
+                },
+                "below": {
+                    "valid": True, "close": 7.0,
+                    "trade_values": {"boll_mid": 8.0},
+                },
+                "invalid": {
+                    "valid": False, "close": 100.0,
+                    "trade_values": {"boll_mid": 1.0},
+                },
+            },
+            {
+                "state": "RISK_ON", "status": "RECORDED",
+                "universe_count": 4, "valid_count": 3,
+                "at_or_above_count": 2, "below_count": 1,
+                "invalid_count": 1, "at_or_above_ratio": 2.0 / 3.0,
+            },
+        ),
+        (
+            {
+                "above": {
+                    "valid": True, "close": 10.0,
+                    "trade_values": {"boll_mid": 9.0},
+                },
+                "below_1": {
+                    "valid": True, "close": 7.0,
+                    "trade_values": {"boll_mid": 8.0},
+                },
+                "below_2": {
+                    "valid": True, "close": 6.0,
+                    "trade_values": {"boll_mid": 8.0},
+                },
+            },
+            {
+                "state": "RISK_OFF", "status": "RECORDED",
+                "universe_count": 3, "valid_count": 3,
+                "at_or_above_count": 1, "below_count": 2,
+                "invalid_count": 0, "at_or_above_ratio": 1.0 / 3.0,
+            },
+        ),
+        (
+            {
+                "invalid_flag": {
+                    "valid": False, "close": 10.0,
+                    "trade_values": {"boll_mid": 9.0},
+                },
+                "invalid_close": {
+                    "valid": True, "close": float("nan"),
+                    "trade_values": {"boll_mid": 9.0},
+                },
+                "invalid_mid": {
+                    "valid": True, "close": 10.0,
+                    "trade_values": {"boll_mid": None},
+                },
+            },
+            {
+                "state": "UNKNOWN", "status": "NO_VALID_SNAPSHOTS",
+                "universe_count": 3, "valid_count": 0,
+                "at_or_above_count": 0, "below_count": 0,
+                "invalid_count": 3, "at_or_above_ratio": None,
+            },
+        ),
+    ],
+)
+def test_market_breadth_observation_uses_only_valid_t1_snapshots(
+        snapshots, expected):
+    observation = strategy.build_market_breadth_observation(
+        snapshots, date(2021, 1, 11), date(2021, 1, 8),
+    )
+
+    assert observation == {
+        "decision_date": date(2021, 1, 11),
+        "signal_date": date(2021, 1, 8),
+        **expected,
+    }
+
+
+def test_market_breadth_observation_log_contains_auditable_identity(
+        monkeypatch):
+    messages = []
+    monkeypatch.setattr(
+        strategy, "log",
+        types.SimpleNamespace(info=lambda message: messages.append(message)),
+        raising=False,
+    )
+    monkeypatch.setattr(strategy, "g", runtime_state(), raising=False)
+
+    strategy.log_market_breadth_observation(
+        {
+            "above": {
+                "valid": True, "close": 10.0,
+                "trade_values": {"boll_mid": 9.0},
+            },
+            "below": {
+                "valid": True, "close": 7.0,
+                "trade_values": {"boll_mid": 8.0},
+            },
+        },
+        date(2021, 1, 11),
+        date(2021, 1, 8),
+    )
+
+    payload = json.loads(messages[-1])
+    assert payload["event"] == "market_breadth_observation"
+    assert payload["build"] == "20260902.3"
+    assert payload["parameter_fingerprint"] == "e1227fbd8b4a884e"
+    assert payload["pool_fingerprint"] == "9123995edeb1ed84"
+    assert payload["policy"] == (
+        "T1_POOL_CLOSE_AT_OR_ABOVE_BOLL_MID_MAJORITY"
+    )
+    assert payload["risk_on_minimum_ratio"] == 0.5
+    assert payload["state"] == "RISK_ON"
+    assert payload["valid_count"] == 2
+    assert payload["at_or_above_count"] == 1
 
 
 def test_atr_before_insufficient_signal_data_still_runs(monkeypatch):
@@ -2315,7 +2447,7 @@ def test_current_quote_does_not_change_frozen_buy_candidate_order(monkeypatch):
     first, second = "159915.XSHE", "510300.XSHG"
     snapshots = {
         first: resonance_snapshot(first, support_count=3),
-        second: resonance_snapshot(second, support_count=2),
+        second: resonance_snapshot(second, support_count=3),
     }
     observed_orders = []
 
@@ -3040,9 +3172,18 @@ def test_initialize_emits_version_and_separate_configuration_fingerprints(
     payload = json.loads(messages[-1])
     assert payload["event"] == "strategy_initialized"
     assert payload["version"] == strategy.STRATEGY_VERSION
-    assert payload["build"] == "20260828.5"
+    assert payload["build"] == "20260902.3"
     assert payload["atr_exit_policy"] == "OBSERVE_ONLY"
     assert payload["relative_buy_policy"] == "EMPTY_SLOT_BACKFILL"
+    assert payload["relative_buy_priority_policy"] == "DMI_NEGATIVE_FIRST"
+    assert payload["new_buy_support_policy"] == "REQUIRE_ALL_THREE_INDICATORS"
+    assert payload["new_buy_required_support_count"] == 3
+    assert payload["market_breadth_observation_policy"] == (
+        "T1_POOL_CLOSE_AT_OR_ABOVE_BOLL_MID_MAJORITY"
+    )
+    assert payload["market_breadth_risk_on_minimum_ratio"] == 0.5
+    assert "formal_two_support_kdj_policy" not in payload
+    assert "buy_execution_priority_policy" not in payload
     assert payload["parameter_fingerprint"]
     assert payload["pool_fingerprint"]
 
@@ -3195,6 +3336,77 @@ def test_buy_rejection_logs_third_indicator_conflict_and_stale_support(
         (conflict_code, False, "THIRD_INDICATOR_CONFLICT"),
         (stale_code, False, "NO_FRESH_SUPPORTER"),
     ]
+
+
+def test_formal_new_buy_requires_all_three_supporters_but_keeps_observations(
+        monkeypatch):
+    def buy_snapshot(code, rsi_direction, previous_diff, current_diff):
+        book = event_book_for_directions(
+            "BUY_TURN", rsi_direction, "BUY_TURN", "2021-01-05",
+        )
+        book["active"]["KDJ"]["trigger_values"] = {
+            "previous": {
+                "k": 19.0 + previous_diff, "d": 19.0, "j": 16.0,
+                "kd_diff": previous_diff,
+            },
+            "current": {
+                "k": 19.0 + current_diff, "d": 19.0, "j": 22.0,
+                "kd_diff": current_diff,
+            },
+        }
+        return {
+            "code": code,
+            "valid": True,
+            "signal_date": "2021-01-05",
+            "close": 10.0,
+            "entry_atr": 1.0,
+            "event_book": book,
+            "kdj_cross": "NONE",
+        }
+
+    pre_cross_code = "510300.XSHG"
+    golden_cross_code = "159915.XSHE"
+    three_support_code = "512100.XSHG"
+    boll_rsi_code = "159928.XSHE"
+    snapshots = {
+        pre_cross_code: buy_snapshot(
+            pre_cross_code, "NEUTRAL", -2.0, -0.5,
+        ),
+        golden_cross_code: buy_snapshot(
+            golden_cross_code, "NEUTRAL", 0.0, 1.0,
+        ),
+        three_support_code: buy_snapshot(
+            three_support_code, "BUY_TURN", -2.0, -0.5,
+        ),
+        boll_rsi_code: resonance_snapshot(boll_rsi_code, support_count=2),
+    }
+    reasons = []
+    registrations = []
+    monkeypatch.setattr(
+        strategy, "log_resonance_decision",
+        lambda decision, accepted, reason: reasons.append(
+            (decision["code"], accepted, reason)
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        strategy, "register_observation_event",
+        lambda decision, event_date, event_close: registrations.append(
+            decision["code"]
+        ),
+        raising=False,
+    )
+
+    decisions = strategy.collect_buy_decisions(snapshots, {})
+
+    assert [decision["code"] for decision in decisions] == [three_support_code]
+    assert registrations == [
+        pre_cross_code, golden_cross_code, three_support_code, boll_rsi_code,
+    ]
+    assert [
+        code for code, accepted, reason in reasons
+        if accepted is False and reason == "NEW_BUY_REQUIRES_THREE_SUPPORTERS"
+    ] == [pre_cross_code, golden_cross_code, boll_rsi_code]
 
 
 def test_empty_no_event_pool_emits_no_resonance_rejection_logs(monkeypatch):
@@ -3510,7 +3722,7 @@ def test_kdj_cross_field_cannot_change_candidate_order_or_orders(monkeypatch):
         snapshots = {
             first: dict(resonance_snapshot(first, support_count=3),
                         kdj_cross=first_cross),
-            second: dict(resonance_snapshot(second, support_count=2),
+            second: dict(resonance_snapshot(second, support_count=3),
                          kdj_cross=second_cross),
         }
         monkeypatch.setattr(strategy, "g", runtime, raising=False)
@@ -3537,7 +3749,9 @@ def test_kdj_cross_field_cannot_change_candidate_order_or_orders(monkeypatch):
 def test_unheld_complete_sell_resonance_is_recorded_without_order(monkeypatch):
     code = "510300.XSHG"
     runtime = runtime_state()
-    snapshot = resonance_snapshot(code, direction="SELL_TURN")
+    snapshot = resonance_snapshot(
+        code, direction="SELL_TURN", support_count=2,
+    )
     registrations = []
     logs = []
     monkeypatch.setattr(strategy, "g", runtime, raising=False)
@@ -3590,8 +3804,8 @@ def _event_diagnostic_frame(previous_overrides=None, current_overrides=None):
     )
 
 
-def test_diagnostic_build_id_is_bumped():
-    assert strategy.DEPLOYMENT_BUILD_ID == "20260828.5"
+def test_three_indicator_new_buy_candidate_build_id_is_20260902_3():
+    assert strategy.DEPLOYMENT_BUILD_ID == "20260902.3"
 
 
 def test_relative_observation_build_and_formal_fingerprints_are_separated(
@@ -3603,10 +3817,19 @@ def test_relative_observation_build_and_formal_fingerprints_are_separated(
     strategy.initialize(types.SimpleNamespace())
 
     payload = json.loads(messages[-1])
-    assert strategy.DEPLOYMENT_BUILD_ID == "20260828.5"
-    assert payload["build"] == "20260828.5"
+    assert strategy.DEPLOYMENT_BUILD_ID == "20260902.3"
+    assert payload["build"] == "20260902.3"
     assert payload["atr_exit_policy"] == "OBSERVE_ONLY"
     assert payload["relative_buy_policy"] == "EMPTY_SLOT_BACKFILL"
+    assert payload["relative_buy_priority_policy"] == "DMI_NEGATIVE_FIRST"
+    assert payload["new_buy_support_policy"] == "REQUIRE_ALL_THREE_INDICATORS"
+    assert payload["new_buy_required_support_count"] == 3
+    assert payload["market_breadth_observation_policy"] == (
+        "T1_POOL_CLOSE_AT_OR_ABOVE_BOLL_MID_MAJORITY"
+    )
+    assert payload["market_breadth_risk_on_minimum_ratio"] == 0.5
+    assert "formal_two_support_kdj_policy" not in payload
+    assert "buy_execution_priority_policy" not in payload
     assert payload["parameter_fingerprint"] == "e1227fbd8b4a884e"
     assert payload["pool_fingerprint"] == "9123995edeb1ed84"
     assert payload["event_logic_fingerprint"] == "1c0b8a22f48c97c3"
@@ -4001,7 +4224,8 @@ def test_formal_observation_outcome_log_has_no_relative_contract_fields(
     assert forbidden.isdisjoint(payload)
 
 
-def test_relative_buy_backfills_only_after_formal_buy(monkeypatch):
+def test_relative_buy_backfills_only_after_formal_buy(
+        monkeypatch):
     formal_code = "510300.XSHG"
     relative_code = "159915.XSHE"
     formal_snapshot = resonance_snapshot(formal_code)
@@ -4053,6 +4277,76 @@ def test_relative_buy_backfills_only_after_formal_buy(monkeypatch):
         (formal_code, strategy.OrderOutcome.FILLED),
         (relative_code, strategy.OrderOutcome.FILLED),
     ]
+
+
+def test_relative_buy_priority_prefers_negative_dmi_then_original_order(
+        monkeypatch):
+    negative_strong = {
+        "code": "513100.XSHG", "support_count": 3, "boll_age": 1,
+    }
+    negative_weaker = {
+        "code": "510300.XSHG", "support_count": 2, "boll_age": 0,
+    }
+    nonnegative_strong = {
+        "code": "159915.XSHE", "support_count": 3, "boll_age": 0,
+    }
+    decisions = [nonnegative_strong, negative_weaker, negative_strong]
+    snapshots = {
+        "513100.XSHG": {
+            "observation_values": {"plus_di": 20.0, "minus_di": 30.0},
+        },
+        "510300.XSHG": {
+            "observation_values": {"plus_di": 25.0, "minus_di": 26.0},
+        },
+        "159915.XSHE": {
+            "observation_values": {"plus_di": 31.0, "minus_di": 30.0},
+        },
+    }
+    monkeypatch.setattr(
+        strategy, "collect_relative_buy_decisions",
+        lambda actual_snapshots: decisions,
+    )
+
+    prepared = strategy.prepare_relative_buy_decisions(snapshots)
+
+    assert [item["code"] for item in prepared] == [
+        "513100.XSHG", "510300.XSHG", "159915.XSHE",
+    ]
+
+
+def test_relative_buy_dmi_zero_and_invalid_values_remain_nonpreferred(
+        monkeypatch):
+    decisions = [
+        {"code": "513100.XSHG", "support_count": 3, "boll_age": 0},
+        {"code": "510300.XSHG", "support_count": 2, "boll_age": 0},
+        {"code": "159915.XSHE", "support_count": 3, "boll_age": 1},
+        {"code": "512100.XSHG", "support_count": 3, "boll_age": 0},
+    ]
+    snapshots = {
+        "513100.XSHG": {
+            "observation_values": {"plus_di": 20.0, "minus_di": 20.0},
+        },
+        "510300.XSHG": {
+            "observation_values": {"plus_di": 19.0, "minus_di": 20.0},
+        },
+        "159915.XSHE": {"observation_values": {}},
+        "512100.XSHG": {
+            "observation_values": {
+                "plus_di": float("nan"), "minus_di": 20.0,
+            },
+        },
+    }
+    monkeypatch.setattr(
+        strategy, "collect_relative_buy_decisions",
+        lambda actual_snapshots: decisions,
+    )
+
+    prepared = strategy.prepare_relative_buy_decisions(snapshots)
+
+    assert [item["code"] for item in prepared] == [
+        "510300.XSHG", "512100.XSHG", "513100.XSHG", "159915.XSHE",
+    ]
+    assert len(prepared) == len(decisions)
 
 
 def test_relative_buy_collection_error_does_not_block_formal_buy(monkeypatch):
@@ -4171,6 +4465,118 @@ def test_formal_buy_keeps_priority_when_relative_buy_competes_for_last_slot(
     assert submitted == [formal_code]
     assert results == [(formal_code, strategy.OrderOutcome.FILLED)]
     assert (relative_code, False, "PORTFOLIO_FULL") in reasons
+    assert not any(
+        reason.startswith("BUY_EXECUTION_CANDIDATE_SORTED:")
+        for _, _, reason in reasons
+    )
+
+
+def test_equal_support_keeps_formal_before_relative_for_last_slot(monkeypatch):
+    formal_code = "510300.XSHG"
+    relative_code = "159915.XSHE"
+    formal_snapshot = resonance_snapshot(formal_code, support_count=3)
+    relative_snapshot = resonance_snapshot(relative_code)
+    relative_snapshot["event_book"] = strategy.empty_event_book()
+    relative_snapshot["relative_event_book"] = (
+        relative_event_book_for_directions(
+            "BUY_TURN", "BUY_TURN", "BUY_TURN", "2021-01-05",
+        )
+    )
+    runtime = runtime_state(max_holdings=1)
+    context = fake_context()
+    current_data = {
+        formal_code: current_record(), relative_code: current_record(),
+    }
+    submitted = []
+    monkeypatch.setattr(strategy, "g", runtime, raising=False)
+    monkeypatch.setattr(
+        strategy, "get_current_data", lambda: current_data, raising=False,
+    )
+    monkeypatch.setattr(
+        strategy, "log_resonance_decision", lambda *args: None,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        strategy, "log_order_transition", lambda *args: None, raising=False,
+    )
+
+    def fill_order(code, target_value):
+        submitted.append(code)
+        context.portfolio.positions[code] = fake_position(100)
+        return types.SimpleNamespace(amount=100, filled=100)
+
+    monkeypatch.setattr(
+        strategy, "order_target_value", fill_order, raising=False,
+    )
+
+    snapshots = {
+        formal_code: formal_snapshot,
+        relative_code: relative_snapshot,
+    }
+    relative_decisions = strategy.prepare_relative_buy_decisions(snapshots)
+
+    results = strategy.run_signal_buys(
+        context, current_data, snapshots, relative_decisions,
+    )
+
+    assert submitted == [formal_code]
+    assert results == [(formal_code, strategy.OrderOutcome.FILLED)]
+
+
+def test_relative_new_buy_requires_three_supporters_but_keeps_observation(
+        monkeypatch):
+    two_support_code = "510300.XSHG"
+    three_support_code = "159915.XSHE"
+    two_support_snapshot = resonance_snapshot(two_support_code)
+    two_support_snapshot["event_book"] = event_book_for_directions(
+        "BUY_TURN", "NEUTRAL", "NEUTRAL", "2021-01-05",
+    )
+    two_support_snapshot["relative_event_book"] = (
+        relative_event_book_for_directions(
+            "NEUTRAL", "BUY_TURN", "NEUTRAL", "2021-01-05",
+        )
+    )
+    two_support_snapshot["observation_values"] = {
+        "plus_di": 20.0, "minus_di": 30.0,
+    }
+    three_support_snapshot = resonance_snapshot(three_support_code)
+    three_support_snapshot["event_book"] = strategy.empty_event_book()
+    three_support_snapshot["relative_event_book"] = (
+        relative_event_book_for_directions(
+            "BUY_TURN", "BUY_TURN", "BUY_TURN", "2021-01-05",
+        )
+    )
+    three_support_snapshot["observation_values"] = {
+        "plus_di": 31.0, "minus_di": 30.0,
+    }
+    snapshots = {
+        two_support_code: two_support_snapshot,
+        three_support_code: three_support_snapshot,
+    }
+    reasons = []
+    monkeypatch.setattr(
+        strategy, "log_resonance_decision",
+        lambda decision, accepted, reason: reasons.append(
+            (decision["code"], accepted, reason)
+        ),
+        raising=False,
+    )
+
+    observations = {
+        item["code"]: item
+        for item in strategy.collect_relative_resonance_observations(snapshots)
+        if item["direction"] is strategy.TurnDirection.BUY_TURN
+    }
+    decisions = strategy.collect_relative_buy_decisions(snapshots)
+
+    assert observations[two_support_code]["supporters"] == ("BOLL", "RSI")
+    assert observations[three_support_code]["supporters"] == (
+        "BOLL", "KDJ", "RSI",
+    )
+    assert [item["code"] for item in decisions] == [three_support_code]
+    assert (
+        two_support_code, False, "NEW_BUY_REQUIRES_THREE_SUPPORTERS",
+    ) in reasons
 
 
 def test_relative_sell_observation_never_enters_buy_or_sell_execution(
@@ -4356,7 +4762,11 @@ def test_do_trading_normalizes_ordinary_malformed_relative_books_before_formal_f
     strategy.do_trading(fake_context())
 
     assert calls == ["retry", "atr", "relative", "exits", "buys"]
-    assert diagnostics == [("relative_observation_snapshot", {
+    relative_diagnostics = [
+        item for item in diagnostics
+        if item[0] == "relative_observation_snapshot"
+    ]
+    assert relative_diagnostics == [("relative_observation_snapshot", {
         "code": code,
         "reason": "RELATIVE_EVENT_BOOK_INVALID",
         "error_type": error_type,
