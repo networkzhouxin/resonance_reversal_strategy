@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "archive_date": "2026-08-31",
+  "archive_date": "2026-09-03",
   "strategy": "resonance_reversal",
   "platform": "JoinQuant",
   "training_period": {
@@ -90,6 +90,15 @@
       "source_attachment": "C:\\Users\\C1-CWadmin\\.codex\\attachments\\1ec300d7-7f5c-4988-a38f-49fbd3c321e5\\pasted-text.txt",
       "bytes": 50488834,
       "sha256": "b237ef5c5d10b05e85bea247a31ad4834869c4b09cca781bd104845d2b983e63"
+    },
+    {
+      "file": "resonance-20260903.1-standard.log",
+      "build": "20260903.1",
+      "friction_profile": "standard",
+      "research_status": "REJECTED_ORDINARY_FRICTION",
+      "source_attachment": "C:\\Users\\C1-CWadmin\\.codex\\attachments\\b8c7aae0-29aa-4bfe-8382-3a09122ce214\\pasted-text.txt",
+      "bytes": 51036168,
+      "sha256": "d98a1171689a86f8f65dd18b36ebc033e5c35e1735c755d8ff6076065440ebd9"
     }
   ],
   "excluded_duplicates": [
