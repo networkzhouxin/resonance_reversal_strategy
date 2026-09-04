@@ -9,11 +9,12 @@ from numbers import Real
 
 
 STRATEGY_VERSION = "resonance-v0.1.0"
-DEPLOYMENT_BUILD_ID = "20260902.3"
+DEPLOYMENT_BUILD_ID = "20260904.2"
 FORMAL_EVENT_LOGIC_BUILD_ID = "20260827.3"
 ATR_EXIT_POLICY = "OBSERVE_ONLY"
 RELATIVE_BUY_POLICY = "EMPTY_SLOT_BACKFILL"
 RELATIVE_BUY_PRIORITY_POLICY = "DMI_NEGATIVE_FIRST"
+RELATIVE_NEW_BUY_BRANCH_POLICY = "SOFT_ALL_THREE_ONLY"
 NEW_BUY_SUPPORT_POLICY = "REQUIRE_ALL_THREE_INDICATORS"
 NEW_BUY_REQUIRED_SUPPORT_COUNT = 3
 MARKET_BREADTH_OBSERVATION_POLICY = (
@@ -883,6 +884,7 @@ def initialize(context):
         "atr_exit_policy": ATR_EXIT_POLICY,
         "relative_buy_policy": RELATIVE_BUY_POLICY,
         "relative_buy_priority_policy": RELATIVE_BUY_PRIORITY_POLICY,
+        "relative_new_buy_branch_policy": RELATIVE_NEW_BUY_BRANCH_POLICY,
         "new_buy_support_policy": NEW_BUY_SUPPORT_POLICY,
         "new_buy_required_support_count": NEW_BUY_REQUIRED_SUPPORT_COUNT,
         "market_breadth_observation_policy": (
@@ -2204,6 +2206,11 @@ def collect_relative_buy_decisions(snapshots):
         if not has_required_new_buy_support(decision):
             log_resonance_decision(
                 decision, False, "NEW_BUY_REQUIRES_THREE_SUPPORTERS",
+            )
+            continue
+        if observation.get("branch") == "HARD_BOLL_SOFT_OSC":
+            log_resonance_decision(
+                decision, False, "RELATIVE_BUY_BRANCH_OBSERVE_ONLY",
             )
             continue
         if not is_finite_positive(snapshots[code].get("entry_atr")):
