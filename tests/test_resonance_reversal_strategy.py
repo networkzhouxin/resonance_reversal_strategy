@@ -320,6 +320,45 @@ def test_boll_touch_without_return_inside_is_neutral():
 
 
 @pytest.mark.parametrize(
+    "previous_close,previous_lower,current_close,current_lower,expected",
+    [
+        (7.9, 8.0, 7.7, 7.8, True),
+        (8.0, 8.0, 7.7, 7.8, False),
+        (7.9, 8.0, 7.8, 7.8, False),
+        (8.1, 8.0, 7.7, 7.8, False),
+        (np.nan, 8.0, 7.7, 7.8, False),
+    ],
+)
+def test_boll_lower_persistence_requires_two_strict_complete_close_breaks(
+        previous_close, previous_lower, current_close, current_lower, expected):
+    previous = {"close": previous_close, "boll_lower": previous_lower}
+    current = {"close": current_close, "boll_lower": current_lower}
+
+    assert strategy.detect_boll_lower_persistence_exit(
+        previous, current,
+    ) is expected
+
+
+def test_boll_lower_persistence_decision_preserves_t_minus_one_identity():
+    frame = pd.DataFrame(
+        [
+            {"close": 7.9, "boll_lower": 8.0},
+            {"close": 7.7, "boll_lower": 7.8},
+        ],
+        index=pd.to_datetime(["2021-01-08", "2021-01-11"]),
+    )
+
+    assert strategy.build_boll_lower_persistence_exit_decision(frame) == {
+        "triggered": True,
+        "previous_date": date(2021, 1, 8),
+        "current_date": date(2021, 1, 11),
+        "previous_close": 7.9,
+        "previous_boll_lower": 8.0,
+        "current_close": 7.7,
+        "current_boll_lower": 7.8,
+    }
+
+@pytest.mark.parametrize(
     "values,expected",
     [
         ((45.0, 40.0, 41.0), strategy.TurnDirection.BUY_TURN),
@@ -1262,6 +1301,21 @@ def resonance_snapshot(code, direction="BUY_TURN", signal_date="2021-01-05",
     }
 
 
+def with_boll_lower_persistence_exit(snapshot, triggered=True):
+    result = dict(snapshot)
+    result["boll_lower_persistence_exit"] = {
+        "triggered": triggered,
+        "previous_date": date(2021, 1, 4),
+        "current_date": date(2021, 1, 5),
+        "previous_close": 9.0,
+        "previous_boll_lower": 9.5,
+        "current_close": 8.5,
+        "current_boll_lower": 9.0,
+    }
+    result["close"] = 8.5
+    return result
+
+
 def runtime_state(max_holdings=3, position_states=None, processed=None,
                   sold=None, attempted=None, retried=None):
     params = strategy.get_default_params()
@@ -1277,6 +1331,174 @@ def runtime_state(max_holdings=3, position_states=None, processed=None,
         daily_retried_exits=set() if retried is None else retried,
     )
 
+
+def test_boll_lower_persistence_exit_sells_without_formal_resonance(monkeypatch):
+    code = "510300.XSHG"
+    state = strategy.make_position_state(date(2021, 1, 4), 1.0, 10.0)
+    runtime = runtime_state(position_states={code: state})
+    context = fake_context(positions={code: fake_position(100)})
+    snapshot = with_boll_lower_persistence_exit(resonance_snapshot(code))
+    calls = []
+    monkeypatch.setattr(strategy, "g", runtime, raising=False)
+    monkeypatch.setattr(
+        strategy, "submit_sell",
+        lambda context_arg, order_code, reason, trigger: calls.append(
+            (order_code, reason, trigger)
+        ) or strategy.OrderOutcome.FILLED,
+        raising=False,
+    )
+
+    attempted = strategy.run_signal_exits(
+        context, {code: current_record(8.5)}, {code: snapshot},
+    )
+
+    assert attempted == {code}
+    assert calls == [(
+        code, strategy.ExitReason.BOLL_STRUCTURE_EXIT, pytest.approx(8.5),
+    )]
+
+
+def test_formal_signal_exit_keeps_priority_over_boll_structure_exit(monkeypatch):
+    code = "510300.XSHG"
+    state = strategy.make_position_state(date(2021, 1, 4), 1.0, 10.0)
+    runtime = runtime_state(position_states={code: state})
+    context = fake_context(positions={code: fake_position(100)})
+    snapshot = with_boll_lower_persistence_exit(
+        resonance_snapshot(code, direction="SELL_TURN")
+    )
+    calls = []
+    monkeypatch.setattr(strategy, "g", runtime, raising=False)
+    monkeypatch.setattr(
+        strategy, "submit_sell",
+        lambda context_arg, order_code, reason, trigger: calls.append(
+            (order_code, reason, trigger)
+        ) or strategy.OrderOutcome.FILLED,
+        raising=False,
+    )
+
+    attempted = strategy.run_signal_exits(
+        context, {code: current_record(8.5)}, {code: snapshot},
+    )
+
+    assert attempted == {code}
+    assert calls == [(
+        code, strategy.ExitReason.SIGNAL_EXIT, pytest.approx(8.5),
+    )]
+
+
+def test_boll_structure_exit_respects_minimum_hold_and_strict_trigger(monkeypatch):
+    code = "510300.XSHG"
+    state = strategy.make_position_state(date(2021, 1, 6), 1.0, 10.0)
+    runtime = runtime_state(position_states={code: state})
+    context = fake_context(positions={code: fake_position(100)})
+    monkeypatch.setattr(strategy, "g", runtime, raising=False)
+    monkeypatch.setattr(
+        strategy, "submit_sell",
+        lambda *args: pytest.fail("same-day or false structure must not sell"),
+        raising=False,
+    )
+
+    assert strategy.run_signal_exits(
+        context, {code: current_record(8.5)},
+        {code: with_boll_lower_persistence_exit(resonance_snapshot(code))},
+    ) == set()
+
+    state["buy_date"] = date(2021, 1, 4)
+    assert strategy.run_signal_exits(
+        context, {code: current_record(8.5)},
+        {code: with_boll_lower_persistence_exit(
+            resonance_snapshot(code), triggered=False,
+        )},
+    ) == set()
+
+
+def test_paused_boll_structure_exit_freezes_pending_reason(monkeypatch):
+    code = "510300.XSHG"
+    state = strategy.make_position_state(date(2021, 1, 4), 1.0, 10.0)
+    runtime = runtime_state(position_states={code: state})
+    context = fake_context(positions={code: fake_position(100)})
+    snapshot = with_boll_lower_persistence_exit(resonance_snapshot(code))
+    monkeypatch.setattr(strategy, "g", runtime, raising=False)
+    monkeypatch.setattr(
+        strategy, "submit_sell",
+        lambda *args: pytest.fail("paused structure exit must not submit"),
+        raising=False,
+    )
+
+    assert strategy.run_signal_exits(
+        context, {code: current_record(8.5, paused=True)}, {code: snapshot},
+    ) == set()
+    assert state["pending_exit"] == {
+        "created_date": date(2021, 1, 6),
+        "reason": strategy.ExitReason.BOLL_STRUCTURE_EXIT,
+        "trigger_value": 8.5,
+        "remaining_amount": 100,
+    }
+
+def test_boll_structure_exit_does_not_overwrite_existing_pending_exit(
+        monkeypatch):
+    code = "510300.XSHG"
+    state = strategy.make_position_state(date(2021, 1, 4), 1.0, 10.0)
+    strategy.set_pending_exit(
+        state, strategy.ExitReason.SIGNAL_EXIT, date(2021, 1, 5), 9.0, 100,
+    )
+    expected_pending = dict(state["pending_exit"])
+    runtime = runtime_state(position_states={code: state})
+    context = fake_context(positions={code: fake_position(100)})
+    monkeypatch.setattr(strategy, "g", runtime, raising=False)
+    monkeypatch.setattr(
+        strategy, "submit_sell",
+        lambda *args: pytest.fail("existing pending exit must not be replaced"),
+        raising=False,
+    )
+
+    assert strategy.run_signal_exits(
+        context, {code: current_record(8.5)},
+        {code: with_boll_lower_persistence_exit(resonance_snapshot(code))},
+    ) == set()
+    assert state["pending_exit"] == expected_pending
+
+
+def test_boll_structure_exit_log_has_build_policy_and_t1_evidence(monkeypatch):
+    messages = []
+    monkeypatch.setattr(
+        strategy, "log",
+        types.SimpleNamespace(info=lambda message: messages.append(message)),
+        raising=False,
+    )
+    structure_decision = {
+        "triggered": True,
+        "previous_date": date(2021, 1, 8),
+        "current_date": date(2021, 1, 11),
+        "previous_close": 7.9,
+        "previous_boll_lower": 8.0,
+        "current_close": 7.7,
+        "current_boll_lower": 7.8,
+    }
+
+    strategy.log_boll_structure_exit_decision(
+        "510300.XSHG", date(2021, 1, 12), structure_decision, True,
+        "BOLL_STRUCTURE_EXIT_ATTEMPT",
+    )
+
+    payload = json.loads(messages[-1])
+    assert payload == {
+        "accepted": True,
+        "build": "20260904.1",
+        "code": "510300.XSHG",
+        "current_boll_lower": 7.8,
+        "current_close": 7.7,
+        "current_date": "2021-01-11",
+        "decision_date": "2021-01-12",
+        "event": "boll_structure_exit_decision",
+        "policy": "T1_T2_CLOSE_STRICTLY_BELOW_OWN_LOWER",
+        "previous_boll_lower": 8.0,
+        "previous_close": 7.9,
+        "previous_date": "2021-01-08",
+        "reason": "BOLL_STRUCTURE_EXIT_ATTEMPT",
+        "triggered": True,
+        "version": "resonance-v0.1.0",
+    }
 
 def test_signal_loader_is_strictly_t_minus_one(monkeypatch):
     calls = []
@@ -1364,6 +1586,8 @@ def test_build_signal_snapshot_keeps_observations_out_of_event_builder(
     assert snapshot["valid"] is True
     assert snapshot["signal_date"] == signal_date
     assert snapshot["close"] == pytest.approx(20.0)
+    assert snapshot["boll_lower_persistence_exit"]["triggered"] is False
+    assert snapshot["boll_lower_persistence_exit"]["current_date"] == signal_date
     assert set(snapshot["trade_values"]) == set(strategy.TRADE_INDICATOR_COLUMNS)
     assert set(snapshot["observation_values"]) == set(strategy.OBSERVATION_COLUMNS)
     assert captured[0][1:] == (signal_date, decision_date)
@@ -1662,7 +1886,7 @@ def test_market_breadth_observation_log_contains_auditable_identity(
 
     payload = json.loads(messages[-1])
     assert payload["event"] == "market_breadth_observation"
-    assert payload["build"] == "20260902.3"
+    assert payload["build"] == "20260904.1"
     assert payload["parameter_fingerprint"] == "e1227fbd8b4a884e"
     assert payload["pool_fingerprint"] == "9123995edeb1ed84"
     assert payload["policy"] == (
@@ -3172,8 +3396,11 @@ def test_initialize_emits_version_and_separate_configuration_fingerprints(
     payload = json.loads(messages[-1])
     assert payload["event"] == "strategy_initialized"
     assert payload["version"] == strategy.STRATEGY_VERSION
-    assert payload["build"] == "20260902.3"
+    assert payload["build"] == "20260904.1"
     assert payload["atr_exit_policy"] == "OBSERVE_ONLY"
+    assert payload["boll_structure_exit_policy"] == (
+        "T1_T2_CLOSE_STRICTLY_BELOW_OWN_LOWER"
+    )
     assert payload["relative_buy_policy"] == "EMPTY_SLOT_BACKFILL"
     assert payload["relative_buy_priority_policy"] == "DMI_NEGATIVE_FIRST"
     assert payload["new_buy_support_policy"] == "REQUIRE_ALL_THREE_INDICATORS"
@@ -3804,8 +4031,8 @@ def _event_diagnostic_frame(previous_overrides=None, current_overrides=None):
     )
 
 
-def test_three_indicator_new_buy_candidate_build_id_is_20260902_3():
-    assert strategy.DEPLOYMENT_BUILD_ID == "20260902.3"
+def test_boll_structure_exit_candidate_build_id_is_20260904_1():
+    assert strategy.DEPLOYMENT_BUILD_ID == "20260904.1"
 
 
 def test_relative_observation_build_and_formal_fingerprints_are_separated(
@@ -3817,9 +4044,12 @@ def test_relative_observation_build_and_formal_fingerprints_are_separated(
     strategy.initialize(types.SimpleNamespace())
 
     payload = json.loads(messages[-1])
-    assert strategy.DEPLOYMENT_BUILD_ID == "20260902.3"
-    assert payload["build"] == "20260902.3"
+    assert strategy.DEPLOYMENT_BUILD_ID == "20260904.1"
+    assert payload["build"] == "20260904.1"
     assert payload["atr_exit_policy"] == "OBSERVE_ONLY"
+    assert payload["boll_structure_exit_policy"] == (
+        "T1_T2_CLOSE_STRICTLY_BELOW_OWN_LOWER"
+    )
     assert payload["relative_buy_policy"] == "EMPTY_SLOT_BACKFILL"
     assert payload["relative_buy_priority_policy"] == "DMI_NEGATIVE_FIRST"
     assert payload["new_buy_support_policy"] == "REQUIRE_ALL_THREE_INDICATORS"
@@ -5368,6 +5598,9 @@ def test_signal_snapshot_log_contains_trace_and_event_logic_fingerprint(
     assert payload["event_detection_trace"]["boll"]["direction"] == "BUY_TURN"
     assert payload["event_detection_trace"]["previous_date"] == "2021-01-08"
     assert payload["event_detection_trace"]["current_date"] == "2021-01-11"
+    assert payload["boll_structure_exit_policy"] == (
+        "T1_T2_CLOSE_STRICTLY_BELOW_OWN_LOWER"
+    )
     assert payload["event_logic_fingerprint"] == strategy.event_logic_fingerprint(
         runtime.params,
         strategy.run_event_logic_self_check(runtime.params),

@@ -9,9 +9,10 @@ from numbers import Real
 
 
 STRATEGY_VERSION = "resonance-v0.1.0"
-DEPLOYMENT_BUILD_ID = "20260902.3"
+DEPLOYMENT_BUILD_ID = "20260904.1"
 FORMAL_EVENT_LOGIC_BUILD_ID = "20260827.3"
 ATR_EXIT_POLICY = "OBSERVE_ONLY"
+BOLL_STRUCTURE_EXIT_POLICY = "T1_T2_CLOSE_STRICTLY_BELOW_OWN_LOWER"
 RELATIVE_BUY_POLICY = "EMPTY_SLOT_BACKFILL"
 RELATIVE_BUY_PRIORITY_POLICY = "DMI_NEGATIVE_FIRST"
 NEW_BUY_SUPPORT_POLICY = "REQUIRE_ALL_THREE_INDICATORS"
@@ -43,6 +44,7 @@ class OrderSide(Enum):
 class ExitReason(Enum):
     ATR_EXIT = "ATR_EXIT"
     SIGNAL_EXIT = "SIGNAL_EXIT"
+    BOLL_STRUCTURE_EXIT = "BOLL_STRUCTURE_EXIT"
 
 
 class Tradability(Enum):
@@ -61,6 +63,7 @@ class OrderOutcome(Enum):
 
 EXIT_PRIORITY = {
     ExitReason.SIGNAL_EXIT: 1,
+    ExitReason.BOLL_STRUCTURE_EXIT: 1,
     ExitReason.ATR_EXIT: 2,
 }
 
@@ -244,6 +247,10 @@ def log_signal_snapshot(snapshot):
         "observation_values": dict(snapshot.get("observation_values") or {}),
         "event_detection_trace": dict(
             snapshot.get("event_detection_trace") or {}
+        ),
+        "boll_structure_exit_policy": BOLL_STRUCTURE_EXIT_POLICY,
+        "boll_lower_persistence_exit": dict(
+            snapshot.get("boll_lower_persistence_exit") or {}
         ),
         "kdj_cross": snapshot.get("kdj_cross", "NONE"),
         "active_events": dict(event_book.get("active") or {}),
@@ -881,6 +888,7 @@ def initialize(context):
         ),
         "relative_observation_fingerprint": relative_observation_fingerprint(),
         "atr_exit_policy": ATR_EXIT_POLICY,
+        "boll_structure_exit_policy": BOLL_STRUCTURE_EXIT_POLICY,
         "relative_buy_policy": RELATIVE_BUY_POLICY,
         "relative_buy_priority_policy": RELATIVE_BUY_PRIORITY_POLICY,
         "new_buy_support_policy": NEW_BUY_SUPPORT_POLICY,
@@ -968,6 +976,9 @@ def build_signal_snapshot(code, prev_date, params, decision_date):
         )
         relative_event_book = empty_event_book()
     event_detection_trace = build_event_detection_trace(indicators, params)
+    boll_lower_persistence_exit = (
+        build_boll_lower_persistence_exit_decision(indicators)
+    )
     return {
         "code": code,
         "valid": True,
@@ -979,6 +990,7 @@ def build_signal_snapshot(code, prev_date, params, decision_date):
         "trade_values": latest[required].to_dict(),
         "observation_values": latest[list(OBSERVATION_COLUMNS)].to_dict(),
         "event_detection_trace": event_detection_trace,
+        "boll_lower_persistence_exit": boll_lower_persistence_exit,
         "kdj_cross": detect_kdj_formal_cross(previous, latest),
     }
 
@@ -1463,6 +1475,33 @@ def detect_boll_direction(previous, current):
             current["close"] < previous["close"]):
         return TurnDirection.SELL_TURN
     return TurnDirection.NEUTRAL
+
+
+def detect_boll_lower_persistence_exit(previous, current):
+    previous_close = _finite_float(previous.get("close"))
+    previous_lower = _finite_float(previous.get("boll_lower"))
+    current_close = _finite_float(current.get("close"))
+    current_lower = _finite_float(current.get("boll_lower"))
+    if _builtins.any(value is None for value in (
+            previous_close, previous_lower, current_close, current_lower)):
+        return False
+    return bool(
+        previous_close < previous_lower and current_close < current_lower
+    )
+
+
+def build_boll_lower_persistence_exit_decision(indicator_frame):
+    previous = indicator_frame.iloc[-2]
+    current = indicator_frame.iloc[-1]
+    return {
+        "triggered": detect_boll_lower_persistence_exit(previous, current),
+        "previous_date": _calendar_date(indicator_frame.index[-2]),
+        "current_date": _calendar_date(indicator_frame.index[-1]),
+        "previous_close": _finite_float(previous.get("close")),
+        "previous_boll_lower": _finite_float(previous.get("boll_lower")),
+        "current_close": _finite_float(current.get("close")),
+        "current_boll_lower": _finite_float(current.get("boll_lower")),
+    }
 
 
 def _finite_float(value):
@@ -2436,6 +2475,20 @@ def observe_atr_exit_conditions(context, current_data):
     return triggered_codes
 
 
+def log_boll_structure_exit_decision(
+        code, decision_date, structure_decision, accepted, reason):
+    _emit_structured_log("boll_structure_exit_decision", {
+        "version": STRATEGY_VERSION,
+        "build": DEPLOYMENT_BUILD_ID,
+        "policy": BOLL_STRUCTURE_EXIT_POLICY,
+        "code": code,
+        "decision_date": decision_date,
+        "accepted": bool(accepted),
+        "reason": reason,
+        **dict(structure_decision or {}),
+    })
+
+
 def run_signal_exits(context, current_data, snapshots):
     attempted = set()
     decision_date = context.current_dt.date()
@@ -2449,13 +2502,28 @@ def run_signal_exits(context, current_data, snapshots):
             log_resonance_decision(decision, False, "UNHELD_RECORD_ONLY")
     for code in actual_positions:
         decision = sell_decisions.get(code)
+        snapshot = snapshots.get(code) or {}
+        structure_decision = dict(
+            snapshot.get("boll_lower_persistence_exit") or {}
+        )
+        structure_triggered = structure_decision.get("triggered") is True
         if code in g.sold_today:
             if decision is not None:
                 log_resonance_decision(decision, False, "SOLD_TODAY")
+            if structure_triggered:
+                log_boll_structure_exit_decision(
+                    code, decision_date, structure_decision, False,
+                    "SOLD_TODAY",
+                )
             continue
         if code in retried_codes:
             if decision is not None:
                 log_resonance_decision(decision, False, "PENDING_RETRIED_TODAY")
+            if structure_triggered:
+                log_boll_structure_exit_decision(
+                    code, decision_date, structure_decision, False,
+                    "PENDING_RETRIED_TODAY",
+                )
             continue
         state = g.position_states.get(code)
         if state is None:
@@ -2463,33 +2531,68 @@ def run_signal_exits(context, current_data, snapshots):
         if not can_signal_sell(state["buy_date"], decision_date):
             if decision is not None:
                 log_resonance_decision(decision, False, "MINIMUM_HOLD_DAY")
+            if structure_triggered:
+                log_boll_structure_exit_decision(
+                    code, decision_date, structure_decision, False,
+                    "MINIMUM_HOLD_DAY",
+                )
             continue
         pending_exit = state.get("pending_exit")
         if (pending_exit is not None
                 and pending_exit["reason"] is ExitReason.ATR_EXIT):
             if decision is not None:
                 log_resonance_decision(decision, False, "ATR_PENDING_PRIORITY")
+            if structure_triggered:
+                log_boll_structure_exit_decision(
+                    code, decision_date, structure_decision, False,
+                    "ATR_PENDING_PRIORITY",
+                )
             continue
-        if decision is None:
+        if decision is not None:
+            if decision["resonance_id"] in g.processed_resonance_ids:
+                log_resonance_decision(
+                    decision, False, "RESONANCE_ALREADY_PROCESSED",
+                )
+                continue
+            tradability = get_tradability(current_data, code)
+            if tradability is Tradability.PAUSED:
+                set_pending_exit(
+                    state, ExitReason.SIGNAL_EXIT, decision_date,
+                    snapshot["close"], get_actual_amount(context, code),
+                )
+                log_resonance_decision(decision, False, "PAUSED")
+                continue
+            mark_resonance_processed(g.processed_resonance_ids, decision)
+            log_resonance_decision(decision, True, "SIGNAL_EXIT_ATTEMPT")
+            submit_sell(
+                context, code, ExitReason.SIGNAL_EXIT, snapshot["close"],
+            )
+            attempted.add(code)
             continue
-        snapshot = snapshots[code]
-        if decision["resonance_id"] in g.processed_resonance_ids:
-            log_resonance_decision(
-                decision, False, "RESONANCE_ALREADY_PROCESSED",
+        if not structure_triggered:
+            continue
+        if pending_exit is not None:
+            log_boll_structure_exit_decision(
+                code, decision_date, structure_decision, False,
+                "PENDING_EXIT_EXISTS",
             )
             continue
         tradability = get_tradability(current_data, code)
         if tradability is Tradability.PAUSED:
             set_pending_exit(
-                state, ExitReason.SIGNAL_EXIT, decision_date,
+                state, ExitReason.BOLL_STRUCTURE_EXIT, decision_date,
                 snapshot["close"], get_actual_amount(context, code),
             )
-            log_resonance_decision(decision, False, "PAUSED")
+            log_boll_structure_exit_decision(
+                code, decision_date, structure_decision, False, "PAUSED",
+            )
             continue
-        mark_resonance_processed(g.processed_resonance_ids, decision)
-        log_resonance_decision(decision, True, "SIGNAL_EXIT_ATTEMPT")
+        log_boll_structure_exit_decision(
+            code, decision_date, structure_decision, True,
+            "BOLL_STRUCTURE_EXIT_ATTEMPT",
+        )
         submit_sell(
-            context, code, ExitReason.SIGNAL_EXIT, snapshot["close"],
+            context, code, ExitReason.BOLL_STRUCTURE_EXIT, snapshot["close"],
         )
         attempted.add(code)
     return attempted
