@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "archive_date": "2026-08-31",
+  "archive_date": "2026-09-04",
   "strategy": "resonance_reversal",
   "platform": "JoinQuant",
   "training_period": {
@@ -90,6 +90,15 @@
       "source_attachment": "C:\\Users\\C1-CWadmin\\.codex\\attachments\\1ec300d7-7f5c-4988-a38f-49fbd3c321e5\\pasted-text.txt",
       "bytes": 50488834,
       "sha256": "b237ef5c5d10b05e85bea247a31ad4834869c4b09cca781bd104845d2b983e63"
+    },
+    {
+      "file": "resonance-20260904.2-standard.log",
+      "build": "20260904.2",
+      "friction_profile": "standard",
+      "classification_basis": "The user provided this attachment as the latest strategy backtest log and confirmed adoption as the risk-control baseline.",
+      "source_attachment": "C:\\Users\\C1-CWadmin\\.codex\\attachments\\8c4e779a-fcd3-48ec-8059-67259044448d\\pasted-text.txt",
+      "bytes": 50879111,
+      "sha256": "32749eb9a4a2762fa26ce7ad8d7ee5b4e8dd7b45fb6bf659d7b8cd1566d25885"
     }
   ],
   "excluded_duplicates": [

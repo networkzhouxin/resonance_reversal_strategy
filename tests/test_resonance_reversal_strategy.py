@@ -1662,7 +1662,7 @@ def test_market_breadth_observation_log_contains_auditable_identity(
 
     payload = json.loads(messages[-1])
     assert payload["event"] == "market_breadth_observation"
-    assert payload["build"] == "20260902.3"
+    assert payload["build"] == "20260904.2"
     assert payload["parameter_fingerprint"] == "e1227fbd8b4a884e"
     assert payload["pool_fingerprint"] == "9123995edeb1ed84"
     assert payload["policy"] == (
@@ -3172,10 +3172,11 @@ def test_initialize_emits_version_and_separate_configuration_fingerprints(
     payload = json.loads(messages[-1])
     assert payload["event"] == "strategy_initialized"
     assert payload["version"] == strategy.STRATEGY_VERSION
-    assert payload["build"] == "20260902.3"
+    assert payload["build"] == "20260904.2"
     assert payload["atr_exit_policy"] == "OBSERVE_ONLY"
     assert payload["relative_buy_policy"] == "EMPTY_SLOT_BACKFILL"
     assert payload["relative_buy_priority_policy"] == "DMI_NEGATIVE_FIRST"
+    assert payload["relative_new_buy_branch_policy"] == "SOFT_ALL_THREE_ONLY"
     assert payload["new_buy_support_policy"] == "REQUIRE_ALL_THREE_INDICATORS"
     assert payload["new_buy_required_support_count"] == 3
     assert payload["market_breadth_observation_policy"] == (
@@ -3804,8 +3805,8 @@ def _event_diagnostic_frame(previous_overrides=None, current_overrides=None):
     )
 
 
-def test_three_indicator_new_buy_candidate_build_id_is_20260902_3():
-    assert strategy.DEPLOYMENT_BUILD_ID == "20260902.3"
+def test_hard_boll_relative_buy_observe_only_candidate_build_id_is_20260904_2():
+    assert strategy.DEPLOYMENT_BUILD_ID == "20260904.2"
 
 
 def test_relative_observation_build_and_formal_fingerprints_are_separated(
@@ -3817,11 +3818,12 @@ def test_relative_observation_build_and_formal_fingerprints_are_separated(
     strategy.initialize(types.SimpleNamespace())
 
     payload = json.loads(messages[-1])
-    assert strategy.DEPLOYMENT_BUILD_ID == "20260902.3"
-    assert payload["build"] == "20260902.3"
+    assert strategy.DEPLOYMENT_BUILD_ID == "20260904.2"
+    assert payload["build"] == "20260904.2"
     assert payload["atr_exit_policy"] == "OBSERVE_ONLY"
     assert payload["relative_buy_policy"] == "EMPTY_SLOT_BACKFILL"
     assert payload["relative_buy_priority_policy"] == "DMI_NEGATIVE_FIRST"
+    assert payload["relative_new_buy_branch_policy"] == "SOFT_ALL_THREE_ONLY"
     assert payload["new_buy_support_policy"] == "REQUIRE_ALL_THREE_INDICATORS"
     assert payload["new_buy_required_support_count"] == 3
     assert payload["market_breadth_observation_policy"] == (
@@ -4576,6 +4578,56 @@ def test_relative_new_buy_requires_three_supporters_but_keeps_observation(
     assert [item["code"] for item in decisions] == [three_support_code]
     assert (
         two_support_code, False, "NEW_BUY_REQUIRES_THREE_SUPPORTERS",
+    ) in reasons
+
+
+def test_hard_boll_soft_osc_relative_buy_is_observe_only(monkeypatch):
+    hard_branch_code = "510300.XSHG"
+    soft_branch_code = "159915.XSHE"
+    hard_branch_snapshot = resonance_snapshot(hard_branch_code)
+    hard_branch_snapshot["event_book"] = event_book_for_directions(
+        "BUY_TURN", "NEUTRAL", "NEUTRAL", "2021-01-05",
+    )
+    hard_branch_snapshot["relative_event_book"] = (
+        relative_event_book_for_directions(
+            "NEUTRAL", "BUY_TURN", "BUY_TURN", "2021-01-05",
+        )
+    )
+    soft_branch_snapshot = resonance_snapshot(soft_branch_code)
+    soft_branch_snapshot["event_book"] = strategy.empty_event_book()
+    soft_branch_snapshot["relative_event_book"] = (
+        relative_event_book_for_directions(
+            "BUY_TURN", "BUY_TURN", "BUY_TURN", "2021-01-05",
+        )
+    )
+    snapshots = {
+        hard_branch_code: hard_branch_snapshot,
+        soft_branch_code: soft_branch_snapshot,
+    }
+    reasons = []
+    monkeypatch.setattr(
+        strategy, "log_resonance_decision",
+        lambda decision, accepted, reason: reasons.append(
+            (decision["code"], accepted, reason)
+        ),
+        raising=False,
+    )
+
+    observations = {
+        item["code"]: item
+        for item in strategy.collect_relative_resonance_observations(snapshots)
+        if item["direction"] is strategy.TurnDirection.BUY_TURN
+    }
+    decisions = strategy.collect_relative_buy_decisions(snapshots)
+
+    assert observations[hard_branch_code]["branch"] == "HARD_BOLL_SOFT_OSC"
+    assert observations[hard_branch_code]["supporters"] == (
+        "BOLL", "KDJ", "RSI",
+    )
+    assert observations[soft_branch_code]["branch"] == "SOFT_ALL_THREE"
+    assert [item["code"] for item in decisions] == [soft_branch_code]
+    assert (
+        hard_branch_code, False, "RELATIVE_BUY_BRANCH_OBSERVE_ONLY",
     ) in reasons
 
 
