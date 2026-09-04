@@ -9,10 +9,10 @@ from numbers import Real
 
 
 STRATEGY_VERSION = "resonance-v0.1.0"
-DEPLOYMENT_BUILD_ID = "20260904.3"
+DEPLOYMENT_BUILD_ID = "20260904.5"
 FORMAL_EVENT_LOGIC_BUILD_ID = "20260827.3"
 ATR_EXIT_POLICY = "OBSERVE_ONLY"
-BOLL_STRUCTURE_EXIT_POLICY = "MID_LOSS_CONFIRMATION_ONLY"
+BOLL_STRUCTURE_EXIT_POLICY = "MID_LOSS_OR_LOWER_BREAK"
 RELATIVE_BUY_POLICY = "EMPTY_SLOT_BACKFILL"
 RELATIVE_BUY_PRIORITY_POLICY = "DMI_NEGATIVE_FIRST"
 RELATIVE_NEW_BUY_BRANCH_POLICY = "SOFT_ALL_THREE_ONLY"
@@ -991,6 +991,7 @@ def build_signal_snapshot(code, prev_date, params, decision_date):
         relative_event_book = empty_event_book()
     event_detection_trace = build_event_detection_trace(indicators, params)
     boll_mid_loss_exit = build_boll_mid_loss_exit_decision(indicators)
+    boll_lower_break_exit = build_boll_lower_break_exit_decision(indicators)
     return {
         "code": code,
         "valid": True,
@@ -1004,6 +1005,7 @@ def build_signal_snapshot(code, prev_date, params, decision_date):
         "event_detection_trace": event_detection_trace,
         "kdj_cross": detect_kdj_formal_cross(previous, latest),
         "boll_mid_loss_exit": boll_mid_loss_exit,
+        "boll_lower_break_exit": boll_lower_break_exit,
     }
 
 
@@ -1535,6 +1537,40 @@ def build_boll_mid_loss_exit_decision(indicator_frame):
         "previous_boll_mid": _finite_float(previous.get("boll_mid")),
         "current_close": _finite_float(current.get("close")),
         "current_boll_mid": _finite_float(current.get("boll_mid")),
+    }
+
+
+def detect_boll_lower_break_exit(previous, current):
+    values = tuple(
+        _finite_float(row.get(name))
+        for row in (previous, current)
+        for name in ("close", "boll_lower")
+    )
+    if _builtins.any(value is None for value in values):
+        return False
+    previous_close, previous_lower, current_close, current_lower = values
+    return bool(
+        previous_close < previous_lower
+        and current_close < current_lower
+    )
+
+
+def build_boll_lower_break_exit_decision(indicator_frame):
+    if indicator_frame is None or len(indicator_frame) < 2:
+        return {
+            "triggered": False,
+            "reason": "INSUFFICIENT_COMPLETED_SESSIONS",
+        }
+    previous = indicator_frame.iloc[-2]
+    current = indicator_frame.iloc[-1]
+    return {
+        "triggered": detect_boll_lower_break_exit(previous, current),
+        "previous_date": _calendar_date(indicator_frame.index[-2]),
+        "current_date": _calendar_date(indicator_frame.index[-1]),
+        "previous_close": _finite_float(previous.get("close")),
+        "previous_boll_lower": _finite_float(previous.get("boll_lower")),
+        "current_close": _finite_float(current.get("close")),
+        "current_boll_lower": _finite_float(current.get("boll_lower")),
     }
 
 
@@ -2508,14 +2544,18 @@ def observe_atr_exit_conditions(context, current_data):
 
 def build_boll_structure_exit_decision(snapshot):
     mid_loss = snapshot.get("boll_mid_loss_exit") or {}
-    channels = ()
+    lower_break = snapshot.get("boll_lower_break_exit") or {}
+    channels = []
     evidence = {}
     if mid_loss.get("triggered") is True:
-        channels = ("MID_LOSS_CONFIRMATION",)
+        channels.append("MID_LOSS_CONFIRMATION")
         evidence["MID_LOSS_CONFIRMATION"] = mid_loss
+    if lower_break.get("triggered") is True:
+        channels.append("LOWER_BREAK_CONFIRMATION")
+        evidence["LOWER_BREAK_CONFIRMATION"] = lower_break
     return {
         "triggered": bool(channels),
-        "channels": channels,
+        "channels": tuple(channels),
         "evidence": evidence,
     }
 

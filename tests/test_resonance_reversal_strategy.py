@@ -407,6 +407,63 @@ def test_boll_mid_loss_decision_fails_closed_with_fewer_than_three_sessions():
 
 
 @pytest.mark.parametrize(
+    "previous,current,expected",
+    [
+        (
+            {"close": 7.9, "boll_lower": 8.0},
+            {"close": 7.7, "boll_lower": 7.8},
+            True,
+        ),
+        (
+            {"close": 8.0, "boll_lower": 8.0},
+            {"close": 7.7, "boll_lower": 7.8},
+            False,
+        ),
+        (
+            {"close": 7.9, "boll_lower": 8.0},
+            {"close": 7.8, "boll_lower": 7.8},
+            False,
+        ),
+        (
+            {"close": 8.1, "boll_lower": 8.0},
+            {"close": 7.7, "boll_lower": 7.8},
+            False,
+        ),
+        (
+            {"close": np.nan, "boll_lower": 8.0},
+            {"close": 7.7, "boll_lower": 7.8},
+            False,
+        ),
+    ],
+)
+def test_combined_boll_lower_break_requires_two_strict_complete_closes(
+        previous, current, expected):
+    assert strategy.detect_boll_lower_break_exit(
+        previous, current,
+    ) is expected
+
+
+def test_combined_boll_lower_break_decision_uses_two_completed_sessions():
+    frame = pd.DataFrame(
+        [
+            {"close": 7.9, "boll_lower": 8.0},
+            {"close": 7.7, "boll_lower": 7.8},
+        ],
+        index=pd.to_datetime(["2021-01-08", "2021-01-11"]),
+    )
+
+    assert strategy.build_boll_lower_break_exit_decision(frame) == {
+        "triggered": True,
+        "previous_date": date(2021, 1, 8),
+        "current_date": date(2021, 1, 11),
+        "previous_close": 7.9,
+        "previous_boll_lower": 8.0,
+        "current_close": 7.7,
+        "current_boll_lower": 7.8,
+    }
+
+
+@pytest.mark.parametrize(
     "values,expected",
     [
         ((45.0, 40.0, 41.0), strategy.TurnDirection.BUY_TURN),
@@ -1367,14 +1424,48 @@ def with_boll_mid_loss_exit(snapshot, triggered=True):
     return result
 
 
-def test_boll_structure_exit_decision_exposes_only_enabled_mid_loss_channel():
-    decision = strategy.build_boll_structure_exit_decision(
-        with_boll_mid_loss_exit(resonance_snapshot("510300.XSHG"))
+def with_boll_lower_break_exit(snapshot, triggered=True):
+    result = dict(snapshot)
+    result["boll_lower_break_exit"] = {
+        "triggered": triggered,
+        "previous_date": date(2021, 1, 5),
+        "current_date": date(2021, 1, 6),
+        "previous_close": 7.9,
+        "previous_boll_lower": 8.0,
+        "current_close": 7.7,
+        "current_boll_lower": 7.8,
+    }
+    result["close"] = 7.7
+    return result
+
+
+@pytest.mark.parametrize(
+    "mid_triggered,lower_triggered,expected_channels",
+    [
+        (False, False, ()),
+        (True, False, ("MID_LOSS_CONFIRMATION",)),
+        (False, True, ("LOWER_BREAK_CONFIRMATION",)),
+        (
+            True,
+            True,
+            ("MID_LOSS_CONFIRMATION", "LOWER_BREAK_CONFIRMATION"),
+        ),
+    ],
+)
+def test_combined_boll_structure_exit_truth_table(
+        mid_triggered, lower_triggered, expected_channels):
+    snapshot = with_boll_mid_loss_exit(
+        resonance_snapshot("510300.XSHG"), triggered=mid_triggered,
+    )
+    snapshot = with_boll_lower_break_exit(
+        snapshot, triggered=lower_triggered,
     )
 
-    assert decision["triggered"] is True
-    assert decision["channels"] == ("MID_LOSS_CONFIRMATION",)
-    assert decision["evidence"]["MID_LOSS_CONFIRMATION"]["triggered"] is True
+    decision = strategy.build_boll_structure_exit_decision(snapshot)
+
+    assert decision["triggered"] is bool(expected_channels)
+    assert decision["channels"] == expected_channels
+    assert tuple(decision["evidence"]) == expected_channels
 
 
 def runtime_state(max_holdings=3, position_states=None, processed=None,
@@ -1416,6 +1507,92 @@ def test_boll_mid_loss_exit_sells_without_formal_resonance(monkeypatch):
     assert attempted == {code}
     assert calls == [(
         code, strategy.ExitReason.BOLL_STRUCTURE_EXIT, pytest.approx(9.7),
+    )]
+
+
+def test_combined_lower_break_sells_when_mid_loss_is_not_triggered(monkeypatch):
+    code = "510300.XSHG"
+    state = strategy.make_position_state(date(2021, 1, 4), 1.0, 10.0)
+    runtime = runtime_state(position_states={code: state})
+    context = fake_context(positions={code: fake_position(100)})
+    snapshot = with_boll_mid_loss_exit(
+        resonance_snapshot(code), triggered=False,
+    )
+    snapshot = with_boll_lower_break_exit(snapshot, triggered=True)
+    calls = []
+    monkeypatch.setattr(strategy, "g", runtime, raising=False)
+    monkeypatch.setattr(
+        strategy, "submit_sell",
+        lambda context_arg, order_code, reason, trigger: calls.append(
+            (order_code, reason, trigger)
+        ) or strategy.OrderOutcome.FILLED,
+        raising=False,
+    )
+
+    attempted = strategy.run_signal_exits(
+        context, {code: current_record(7.7)}, {code: snapshot},
+    )
+
+    assert attempted == {code}
+    assert calls == [(
+        code, strategy.ExitReason.BOLL_STRUCTURE_EXIT, pytest.approx(7.7),
+    )]
+
+
+def test_combined_two_structure_channels_submit_only_one_sell(monkeypatch):
+    code = "510300.XSHG"
+    state = strategy.make_position_state(date(2021, 1, 4), 1.0, 10.0)
+    runtime = runtime_state(position_states={code: state})
+    context = fake_context(positions={code: fake_position(100)})
+    snapshot = with_boll_lower_break_exit(
+        with_boll_mid_loss_exit(resonance_snapshot(code)),
+    )
+    calls = []
+    monkeypatch.setattr(strategy, "g", runtime, raising=False)
+    monkeypatch.setattr(
+        strategy, "submit_sell",
+        lambda context_arg, order_code, reason, trigger: calls.append(
+            (order_code, reason, trigger)
+        ) or strategy.OrderOutcome.FILLED,
+        raising=False,
+    )
+
+    attempted = strategy.run_signal_exits(
+        context, {code: current_record(7.7)}, {code: snapshot},
+    )
+
+    assert attempted == {code}
+    assert calls == [(
+        code, strategy.ExitReason.BOLL_STRUCTURE_EXIT, pytest.approx(7.7),
+    )]
+
+
+def test_combined_formal_signal_has_priority_over_both_structure_channels(
+        monkeypatch):
+    code = "510300.XSHG"
+    state = strategy.make_position_state(date(2021, 1, 4), 1.0, 10.0)
+    runtime = runtime_state(position_states={code: state})
+    context = fake_context(positions={code: fake_position(100)})
+    snapshot = with_boll_lower_break_exit(with_boll_mid_loss_exit(
+        resonance_snapshot(code, direction="SELL_TURN")
+    ))
+    calls = []
+    monkeypatch.setattr(strategy, "g", runtime, raising=False)
+    monkeypatch.setattr(
+        strategy, "submit_sell",
+        lambda context_arg, order_code, reason, trigger: calls.append(
+            (order_code, reason, trigger)
+        ) or strategy.OrderOutcome.FILLED,
+        raising=False,
+    )
+
+    attempted = strategy.run_signal_exits(
+        context, {code: current_record(7.7)}, {code: snapshot},
+    )
+
+    assert attempted == {code}
+    assert calls == [(
+        code, strategy.ExitReason.SIGNAL_EXIT, pytest.approx(7.7),
     )]
 
 
@@ -1544,8 +1721,8 @@ def test_boll_mid_loss_structure_log_contains_policy_channels_and_t1_evidence(
 
     payload = json.loads(messages[-1])
     assert payload["event"] == "boll_structure_exit_decision"
-    assert payload["build"] == "20260904.3"
-    assert payload["policy"] == "MID_LOSS_CONFIRMATION_ONLY"
+    assert payload["build"] == "20260904.5"
+    assert payload["policy"] == "MID_LOSS_OR_LOWER_BREAK"
     assert payload["channels"] == ["MID_LOSS_CONFIRMATION"]
     assert payload["evidence"]["MID_LOSS_CONFIRMATION"]["current_date"] == (
         "2021-01-06"
@@ -1553,6 +1730,32 @@ def test_boll_mid_loss_structure_log_contains_policy_channels_and_t1_evidence(
     assert payload["decision_date"] == "2021-01-07"
     assert payload["accepted"] is True
     assert payload["reason"] == "BOLL_STRUCTURE_EXIT_ATTEMPT"
+
+
+def test_combined_structure_log_records_both_triggered_channels(monkeypatch):
+    messages = []
+    snapshot = with_boll_lower_break_exit(
+        with_boll_mid_loss_exit(resonance_snapshot("510300.XSHG"))
+    )
+    decision = strategy.build_boll_structure_exit_decision(snapshot)
+    monkeypatch.setattr(
+        strategy, "log",
+        types.SimpleNamespace(info=lambda message: messages.append(message)),
+        raising=False,
+    )
+
+    strategy.log_boll_structure_exit_decision(
+        "510300.XSHG", date(2021, 1, 7), decision, True,
+        "BOLL_STRUCTURE_EXIT_ATTEMPT",
+    )
+
+    payload = json.loads(messages[-1])
+    assert payload["channels"] == [
+        "MID_LOSS_CONFIRMATION", "LOWER_BREAK_CONFIRMATION",
+    ]
+    assert set(payload["evidence"]) == {
+        "MID_LOSS_CONFIRMATION", "LOWER_BREAK_CONFIRMATION",
+    }
 
 
 def test_signal_loader_is_strictly_t_minus_one(monkeypatch):
@@ -1643,6 +1846,8 @@ def test_build_signal_snapshot_keeps_observations_out_of_event_builder(
     assert snapshot["close"] == pytest.approx(20.0)
     assert snapshot["boll_mid_loss_exit"]["triggered"] is False
     assert snapshot["boll_mid_loss_exit"]["current_date"] == signal_date
+    assert snapshot["boll_lower_break_exit"]["triggered"] is False
+    assert snapshot["boll_lower_break_exit"]["current_date"] == signal_date
     assert set(snapshot["trade_values"]) == set(strategy.TRADE_INDICATOR_COLUMNS)
     assert set(snapshot["observation_values"]) == set(strategy.OBSERVATION_COLUMNS)
     assert captured[0][1:] == (signal_date, decision_date)
@@ -1941,7 +2146,7 @@ def test_market_breadth_observation_log_contains_auditable_identity(
 
     payload = json.loads(messages[-1])
     assert payload["event"] == "market_breadth_observation"
-    assert payload["build"] == "20260904.3"
+    assert payload["build"] == "20260904.5"
     assert payload["parameter_fingerprint"] == "e1227fbd8b4a884e"
     assert payload["pool_fingerprint"] == "9123995edeb1ed84"
     assert payload["policy"] == (
@@ -3451,10 +3656,10 @@ def test_initialize_emits_version_and_separate_configuration_fingerprints(
     payload = json.loads(messages[-1])
     assert payload["event"] == "strategy_initialized"
     assert payload["version"] == strategy.STRATEGY_VERSION
-    assert payload["build"] == "20260904.3"
+    assert payload["build"] == "20260904.5"
     assert payload["atr_exit_policy"] == "OBSERVE_ONLY"
     assert payload["boll_structure_exit_policy"] == (
-        "MID_LOSS_CONFIRMATION_ONLY"
+        "MID_LOSS_OR_LOWER_BREAK"
     )
     assert payload["relative_buy_policy"] == "EMPTY_SLOT_BACKFILL"
     assert payload["relative_buy_priority_policy"] == "DMI_NEGATIVE_FIRST"
@@ -4087,8 +4292,8 @@ def _event_diagnostic_frame(previous_overrides=None, current_overrides=None):
     )
 
 
-def test_boll_mid_loss_exit_candidate_build_id_is_20260904_3():
-    assert strategy.DEPLOYMENT_BUILD_ID == "20260904.3"
+def test_combined_boll_structure_exit_candidate_build_id_is_20260904_5():
+    assert strategy.DEPLOYMENT_BUILD_ID == "20260904.5"
 
 
 def test_relative_observation_build_and_formal_fingerprints_are_separated(
@@ -4100,11 +4305,11 @@ def test_relative_observation_build_and_formal_fingerprints_are_separated(
     strategy.initialize(types.SimpleNamespace())
 
     payload = json.loads(messages[-1])
-    assert strategy.DEPLOYMENT_BUILD_ID == "20260904.3"
-    assert payload["build"] == "20260904.3"
+    assert strategy.DEPLOYMENT_BUILD_ID == "20260904.5"
+    assert payload["build"] == "20260904.5"
     assert payload["atr_exit_policy"] == "OBSERVE_ONLY"
     assert payload["boll_structure_exit_policy"] == (
-        "MID_LOSS_CONFIRMATION_ONLY"
+        "MID_LOSS_OR_LOWER_BREAK"
     )
     assert payload["relative_buy_policy"] == "EMPTY_SLOT_BACKFILL"
     assert payload["relative_buy_priority_policy"] == "DMI_NEGATIVE_FIRST"
