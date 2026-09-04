@@ -320,6 +320,75 @@ def test_boll_touch_without_return_inside_is_neutral():
 
 
 @pytest.mark.parametrize(
+    "previous,current,expected",
+    [
+        (
+            {"close": 7.9, "boll_lower": 8.0},
+            {"close": 7.7, "boll_lower": 7.8},
+            True,
+        ),
+        (
+            {"close": 8.0, "boll_lower": 8.0},
+            {"close": 7.7, "boll_lower": 7.8},
+            False,
+        ),
+        (
+            {"close": 7.9, "boll_lower": 8.0},
+            {"close": 7.8, "boll_lower": 7.8},
+            False,
+        ),
+        (
+            {"close": 8.1, "boll_lower": 8.0},
+            {"close": 7.7, "boll_lower": 7.8},
+            False,
+        ),
+        (
+            {"close": np.nan, "boll_lower": 8.0},
+            {"close": 7.7, "boll_lower": 7.8},
+            False,
+        ),
+    ],
+)
+def test_boll_lower_break_requires_two_strict_complete_closes(
+        previous, current, expected):
+    assert strategy.detect_boll_lower_break_exit(
+        previous, current,
+    ) is expected
+
+
+def test_boll_lower_break_decision_uses_only_two_completed_sessions():
+    frame = pd.DataFrame(
+        [
+            {"close": 7.9, "boll_lower": 8.0},
+            {"close": 7.7, "boll_lower": 7.8},
+        ],
+        index=pd.to_datetime(["2021-01-08", "2021-01-11"]),
+    )
+
+    assert strategy.build_boll_lower_break_exit_decision(frame) == {
+        "triggered": True,
+        "previous_date": date(2021, 1, 8),
+        "current_date": date(2021, 1, 11),
+        "previous_close": 7.9,
+        "previous_boll_lower": 8.0,
+        "current_close": 7.7,
+        "current_boll_lower": 7.8,
+    }
+
+
+def test_boll_lower_break_decision_fails_closed_with_fewer_than_two_sessions():
+    frame = pd.DataFrame(
+        [{"close": 7.7, "boll_lower": 7.8}],
+        index=pd.to_datetime(["2021-01-11"]),
+    )
+
+    assert strategy.build_boll_lower_break_exit_decision(frame) == {
+        "triggered": False,
+        "reason": "INSUFFICIENT_COMPLETED_SESSIONS",
+    }
+
+
+@pytest.mark.parametrize(
     "values,expected",
     [
         ((45.0, 40.0, 41.0), strategy.TurnDirection.BUY_TURN),
@@ -1262,6 +1331,31 @@ def resonance_snapshot(code, direction="BUY_TURN", signal_date="2021-01-05",
     }
 
 
+def with_boll_lower_break_exit(snapshot, triggered=True):
+    result = dict(snapshot)
+    result["boll_lower_break_exit"] = {
+        "triggered": triggered,
+        "previous_date": date(2021, 1, 5),
+        "current_date": date(2021, 1, 6),
+        "previous_close": 7.9,
+        "previous_boll_lower": 8.0,
+        "current_close": 7.7,
+        "current_boll_lower": 7.8,
+    }
+    result["close"] = 7.7
+    return result
+
+
+def test_boll_structure_exit_decision_exposes_only_enabled_lower_break_channel():
+    decision = strategy.build_boll_structure_exit_decision(
+        with_boll_lower_break_exit(resonance_snapshot("510300.XSHG"))
+    )
+
+    assert decision["triggered"] is True
+    assert decision["channels"] == ("LOWER_BREAK_CONFIRMATION",)
+    assert decision["evidence"]["LOWER_BREAK_CONFIRMATION"]["triggered"] is True
+
+
 def runtime_state(max_holdings=3, position_states=None, processed=None,
                   sold=None, attempted=None, retried=None):
     params = strategy.get_default_params()
@@ -1276,6 +1370,167 @@ def runtime_state(max_holdings=3, position_states=None, processed=None,
         daily_attempted_buys=set() if attempted is None else attempted,
         daily_retried_exits=set() if retried is None else retried,
     )
+
+
+def test_boll_lower_break_exit_sells_without_formal_resonance(monkeypatch):
+    code = "510300.XSHG"
+    state = strategy.make_position_state(date(2021, 1, 4), 1.0, 10.0)
+    runtime = runtime_state(position_states={code: state})
+    context = fake_context(positions={code: fake_position(100)})
+    snapshot = with_boll_lower_break_exit(resonance_snapshot(code))
+    calls = []
+    monkeypatch.setattr(strategy, "g", runtime, raising=False)
+    monkeypatch.setattr(
+        strategy, "submit_sell",
+        lambda context_arg, order_code, reason, trigger: calls.append(
+            (order_code, reason, trigger)
+        ) or strategy.OrderOutcome.FILLED,
+        raising=False,
+    )
+
+    attempted = strategy.run_signal_exits(
+        context, {code: current_record(7.7)}, {code: snapshot},
+    )
+
+    assert attempted == {code}
+    assert calls == [(
+        code, strategy.ExitReason.BOLL_STRUCTURE_EXIT, pytest.approx(7.7),
+    )]
+
+
+def test_formal_signal_exit_keeps_priority_over_boll_lower_break(monkeypatch):
+    code = "510300.XSHG"
+    state = strategy.make_position_state(date(2021, 1, 4), 1.0, 10.0)
+    runtime = runtime_state(position_states={code: state})
+    context = fake_context(positions={code: fake_position(100)})
+    snapshot = with_boll_lower_break_exit(
+        resonance_snapshot(code, direction="SELL_TURN")
+    )
+    calls = []
+    monkeypatch.setattr(strategy, "g", runtime, raising=False)
+    monkeypatch.setattr(
+        strategy, "submit_sell",
+        lambda context_arg, order_code, reason, trigger: calls.append(
+            (order_code, reason, trigger)
+        ) or strategy.OrderOutcome.FILLED,
+        raising=False,
+    )
+
+    attempted = strategy.run_signal_exits(
+        context, {code: current_record(7.7)}, {code: snapshot},
+    )
+
+    assert attempted == {code}
+    assert calls == [(
+        code, strategy.ExitReason.SIGNAL_EXIT, pytest.approx(7.7),
+    )]
+
+
+def test_boll_lower_break_exit_respects_minimum_hold_and_trigger(monkeypatch):
+    code = "510300.XSHG"
+    state = strategy.make_position_state(date(2021, 1, 6), 1.0, 10.0)
+    runtime = runtime_state(position_states={code: state})
+    context = fake_context(positions={code: fake_position(100)})
+    monkeypatch.setattr(strategy, "g", runtime, raising=False)
+    monkeypatch.setattr(
+        strategy, "submit_sell",
+        lambda *args: pytest.fail("same-day or false structure must not sell"),
+        raising=False,
+    )
+
+    assert strategy.run_signal_exits(
+        context, {code: current_record(7.7)},
+        {code: with_boll_lower_break_exit(resonance_snapshot(code))},
+    ) == set()
+
+    state["buy_date"] = date(2021, 1, 4)
+    assert strategy.run_signal_exits(
+        context, {code: current_record(7.7)},
+        {code: with_boll_lower_break_exit(
+            resonance_snapshot(code), triggered=False,
+        )},
+    ) == set()
+
+
+def test_paused_boll_lower_break_exit_freezes_pending_reason(monkeypatch):
+    code = "510300.XSHG"
+    state = strategy.make_position_state(date(2021, 1, 4), 1.0, 10.0)
+    runtime = runtime_state(position_states={code: state})
+    context = fake_context(positions={code: fake_position(100)})
+    snapshot = with_boll_lower_break_exit(resonance_snapshot(code))
+    monkeypatch.setattr(strategy, "g", runtime, raising=False)
+    monkeypatch.setattr(
+        strategy, "submit_sell",
+        lambda *args: pytest.fail("paused structure exit must not submit"),
+        raising=False,
+    )
+
+    assert strategy.run_signal_exits(
+        context, {code: current_record(7.7, paused=True)}, {code: snapshot},
+    ) == set()
+    assert state["pending_exit"] == {
+        "created_date": date(2021, 1, 6),
+        "reason": strategy.ExitReason.BOLL_STRUCTURE_EXIT,
+        "trigger_value": 7.7,
+        "remaining_amount": 100,
+    }
+
+
+def test_boll_lower_break_exit_does_not_overwrite_existing_pending(monkeypatch):
+    code = "510300.XSHG"
+    state = strategy.make_position_state(date(2021, 1, 4), 1.0, 10.0)
+    strategy.set_pending_exit(
+        state, strategy.ExitReason.SIGNAL_EXIT, date(2021, 1, 5), 7.9, 100,
+    )
+    expected_pending = dict(state["pending_exit"])
+    runtime = runtime_state(position_states={code: state})
+    context = fake_context(positions={code: fake_position(100)})
+    monkeypatch.setattr(strategy, "g", runtime, raising=False)
+    monkeypatch.setattr(
+        strategy, "submit_sell",
+        lambda *args: pytest.fail("existing pending exit must not be replaced"),
+        raising=False,
+    )
+
+    assert strategy.run_signal_exits(
+        context, {code: current_record(7.7)},
+        {code: with_boll_lower_break_exit(resonance_snapshot(code))},
+    ) == set()
+    assert state["pending_exit"] == expected_pending
+
+
+def test_boll_lower_break_structure_log_contains_policy_channels_and_t1_evidence(
+        monkeypatch):
+    messages = []
+    snapshot = with_boll_lower_break_exit(resonance_snapshot("510300.XSHG"))
+    decision = {
+        "triggered": True,
+        "channels": ("LOWER_BREAK_CONFIRMATION",),
+        "evidence": {
+            "LOWER_BREAK_CONFIRMATION": snapshot["boll_lower_break_exit"],
+        },
+    }
+    monkeypatch.setattr(
+        strategy, "log",
+        types.SimpleNamespace(info=lambda message: messages.append(message)),
+        raising=False,
+    )
+
+    strategy.log_boll_structure_exit_decision(
+        "510300.XSHG", date(2021, 1, 7), decision, True,
+        "BOLL_STRUCTURE_EXIT_ATTEMPT",
+    )
+
+    payload = json.loads(messages[-1])
+    assert payload["event"] == "boll_structure_exit_decision"
+    assert payload["build"] == "20260904.4"
+    assert payload["policy"] == "LOWER_BREAK_CONFIRMATION_ONLY"
+    assert payload["channels"] == ["LOWER_BREAK_CONFIRMATION"]
+    assert payload["evidence"]["LOWER_BREAK_CONFIRMATION"]["current_date"] == (
+        "2021-01-06"
+    )
+    assert payload["decision_date"] == "2021-01-07"
+    assert payload["accepted"] is True
 
 
 def test_signal_loader_is_strictly_t_minus_one(monkeypatch):
@@ -1364,6 +1619,8 @@ def test_build_signal_snapshot_keeps_observations_out_of_event_builder(
     assert snapshot["valid"] is True
     assert snapshot["signal_date"] == signal_date
     assert snapshot["close"] == pytest.approx(20.0)
+    assert snapshot["boll_lower_break_exit"]["triggered"] is False
+    assert snapshot["boll_lower_break_exit"]["current_date"] == signal_date
     assert set(snapshot["trade_values"]) == set(strategy.TRADE_INDICATOR_COLUMNS)
     assert set(snapshot["observation_values"]) == set(strategy.OBSERVATION_COLUMNS)
     assert captured[0][1:] == (signal_date, decision_date)
@@ -1662,7 +1919,7 @@ def test_market_breadth_observation_log_contains_auditable_identity(
 
     payload = json.loads(messages[-1])
     assert payload["event"] == "market_breadth_observation"
-    assert payload["build"] == "20260904.2"
+    assert payload["build"] == "20260904.4"
     assert payload["parameter_fingerprint"] == "e1227fbd8b4a884e"
     assert payload["pool_fingerprint"] == "9123995edeb1ed84"
     assert payload["policy"] == (
@@ -3172,8 +3429,11 @@ def test_initialize_emits_version_and_separate_configuration_fingerprints(
     payload = json.loads(messages[-1])
     assert payload["event"] == "strategy_initialized"
     assert payload["version"] == strategy.STRATEGY_VERSION
-    assert payload["build"] == "20260904.2"
+    assert payload["build"] == "20260904.4"
     assert payload["atr_exit_policy"] == "OBSERVE_ONLY"
+    assert payload["boll_structure_exit_policy"] == (
+        "LOWER_BREAK_CONFIRMATION_ONLY"
+    )
     assert payload["relative_buy_policy"] == "EMPTY_SLOT_BACKFILL"
     assert payload["relative_buy_priority_policy"] == "DMI_NEGATIVE_FIRST"
     assert payload["relative_new_buy_branch_policy"] == "SOFT_ALL_THREE_ONLY"
@@ -3805,8 +4065,8 @@ def _event_diagnostic_frame(previous_overrides=None, current_overrides=None):
     )
 
 
-def test_hard_boll_relative_buy_observe_only_candidate_build_id_is_20260904_2():
-    assert strategy.DEPLOYMENT_BUILD_ID == "20260904.2"
+def test_boll_lower_break_exit_candidate_build_id_is_20260904_4():
+    assert strategy.DEPLOYMENT_BUILD_ID == "20260904.4"
 
 
 def test_relative_observation_build_and_formal_fingerprints_are_separated(
@@ -3818,9 +4078,12 @@ def test_relative_observation_build_and_formal_fingerprints_are_separated(
     strategy.initialize(types.SimpleNamespace())
 
     payload = json.loads(messages[-1])
-    assert strategy.DEPLOYMENT_BUILD_ID == "20260904.2"
-    assert payload["build"] == "20260904.2"
+    assert strategy.DEPLOYMENT_BUILD_ID == "20260904.4"
+    assert payload["build"] == "20260904.4"
     assert payload["atr_exit_policy"] == "OBSERVE_ONLY"
+    assert payload["boll_structure_exit_policy"] == (
+        "LOWER_BREAK_CONFIRMATION_ONLY"
+    )
     assert payload["relative_buy_policy"] == "EMPTY_SLOT_BACKFILL"
     assert payload["relative_buy_priority_policy"] == "DMI_NEGATIVE_FIRST"
     assert payload["relative_new_buy_branch_policy"] == "SOFT_ALL_THREE_ONLY"
