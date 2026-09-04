@@ -9,7 +9,7 @@ from numbers import Real
 
 
 STRATEGY_VERSION = "resonance-v0.1.0"
-DEPLOYMENT_BUILD_ID = "20260904.2"
+DEPLOYMENT_BUILD_ID = "20260904.6"
 FORMAL_EVENT_LOGIC_BUILD_ID = "20260827.3"
 ATR_EXIT_POLICY = "OBSERVE_ONLY"
 RELATIVE_BUY_POLICY = "EMPTY_SLOT_BACKFILL"
@@ -21,6 +21,7 @@ MARKET_BREADTH_OBSERVATION_POLICY = (
     "T1_POOL_CLOSE_AT_OR_ABOVE_BOLL_MID_MAJORITY"
 )
 MARKET_BREADTH_RISK_ON_MINIMUM_RATIO = 0.5
+CCI_OBSERVATION_PERIOD = 14
 BENCHMARK = "000300.XSHG"
 
 
@@ -874,6 +875,7 @@ def initialize(context):
     _emit_structured_log("strategy_initialized", {
         "version": STRATEGY_VERSION,
         "build": DEPLOYMENT_BUILD_ID,
+        "cci_observation_period": CCI_OBSERVATION_PERIOD,
         "parameter_fingerprint": _value_fingerprint(g.params),
         "pool_fingerprint": _value_fingerprint(g.etf_pool),
         "event_logic_self_check": self_check,
@@ -1300,7 +1302,7 @@ TRADE_INDICATOR_COLUMNS = (
 OBSERVATION_COLUMNS = (
     "rsi6", "rsi12", "rsi24", "plus_di", "minus_di", "adx14",
     "volume", "volume_ma5", "volume_ma20", "volume_ratio",
-    "boll_width", "boll_mid_slope",
+    "boll_width", "boll_mid_slope", "cci14",
 )
 INDICATORS = ("BOLL", "RSI", "KDJ")
 
@@ -1332,6 +1334,26 @@ def calc_kdj(high, low, close, n=9, m1=3, m2=3):
     d = k.ewm(alpha=1.0 / m2, adjust=False, min_periods=1).mean()
     j = 3.0 * k - 2.0 * d
     return k, d, j
+
+
+def calc_cci(high, low, close, period=14):
+    typical_price = (
+        pd.Series(high, dtype=float)
+        + pd.Series(low, dtype=float)
+        + pd.Series(close, dtype=float)
+    ) / 3.0
+    rolling_mean = typical_price.rolling(
+        period, min_periods=period,
+    ).mean()
+    mean_deviation = typical_price.rolling(
+        period, min_periods=period,
+    ).apply(
+        lambda values: np.mean(np.abs(values - np.mean(values))),
+        raw=True,
+    )
+    denominator = 0.015 * mean_deviation
+    cci = (typical_price - rolling_mean) / denominator.replace(0, np.nan)
+    return cci.mask(mean_deviation == 0, 0.0)
 
 
 def calc_bollinger(close, period=20, std_mult=2.0):
@@ -1386,6 +1408,10 @@ def build_indicator_frame(price_frame, params):
     k, d, j = calc_kdj(frame["high"], frame["low"], frame["close"], *params["kdj"])
     frame["k"], frame["d"], frame["j"] = k, d, j
     frame["kd_diff"] = k - d
+    frame["cci14"] = calc_cci(
+        frame["high"], frame["low"], frame["close"],
+        CCI_OBSERVATION_PERIOD,
+    )
     mid, upper, lower = calc_bollinger(frame["close"], *params["boll"])
     frame["boll_mid"], frame["boll_upper"], frame["boll_lower"] = mid, upper, lower
     frame["atr14"] = calc_atr(

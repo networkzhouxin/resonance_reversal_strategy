@@ -220,6 +220,21 @@ def test_dmi_adx_rising_series_is_directional_and_flat_series_is_undefined():
     assert flat_adx.iloc[14:].isna().all()
 
 
+def test_cci_uses_typical_price_mean_deviation_and_handles_flat_range():
+    close = pd.Series([10.0] * 14)
+    high = pd.Series(np.arange(11.0, 25.0))
+    low = pd.Series([9.0] * 14)
+    cci = strategy.calc_cci(high, low, close, period=14)
+
+    assert cci.iloc[:-1].isna().all()
+    assert cci.iloc[-1] == pytest.approx(123.80952380952381)
+
+    flat = pd.Series([10.0] * 14)
+    flat_cci = strategy.calc_cci(flat, flat, flat, period=14)
+    assert flat_cci.iloc[:-1].isna().all()
+    assert flat_cci.iloc[-1] == pytest.approx(0.0)
+
+
 def test_indicator_frame_separates_trade_and_observation_columns():
     frame = strategy.build_indicator_frame(make_ohlcv_frame(140), strategy.get_default_params())
     assert set(strategy.TRADE_INDICATOR_COLUMNS) == {
@@ -229,7 +244,7 @@ def test_indicator_frame_separates_trade_and_observation_columns():
     assert set(strategy.OBSERVATION_COLUMNS) == {
         "rsi6", "rsi12", "rsi24", "plus_di", "minus_di", "adx14",
         "volume", "volume_ma5", "volume_ma20", "volume_ratio",
-        "boll_width", "boll_mid_slope",
+        "boll_width", "boll_mid_slope", "cci14",
     }
     assert set(strategy.TRADE_INDICATOR_COLUMNS).isdisjoint(strategy.OBSERVATION_COLUMNS)
 
@@ -257,6 +272,9 @@ def test_indicator_frame_populates_trade_and_observation_values():
     assert frame["volume_ratio"].iloc[-1] == pytest.approx(3100.0 / 2150.0)
     assert frame["boll_width"].iloc[-1] == pytest.approx(1.0497286790354372)
     assert frame["boll_mid_slope"].iloc[-1] == pytest.approx(0.9)
+    assert frame["cci14"].iloc[:13].isna().all()
+    assert np.isfinite(frame["cci14"].iloc[13])
+    assert np.isfinite(frame["cci14"].iloc[-1])
 
 
 def make_event(indicator, direction, event_date, expires_date,
@@ -1366,6 +1384,7 @@ def test_build_signal_snapshot_keeps_observations_out_of_event_builder(
     assert snapshot["close"] == pytest.approx(20.0)
     assert set(snapshot["trade_values"]) == set(strategy.TRADE_INDICATOR_COLUMNS)
     assert set(snapshot["observation_values"]) == set(strategy.OBSERVATION_COLUMNS)
+    assert np.isfinite(snapshot["observation_values"]["cci14"])
     assert captured[0][1:] == (signal_date, decision_date)
 
 
@@ -1662,7 +1681,7 @@ def test_market_breadth_observation_log_contains_auditable_identity(
 
     payload = json.loads(messages[-1])
     assert payload["event"] == "market_breadth_observation"
-    assert payload["build"] == "20260904.2"
+    assert payload["build"] == "20260904.6"
     assert payload["parameter_fingerprint"] == "e1227fbd8b4a884e"
     assert payload["pool_fingerprint"] == "9123995edeb1ed84"
     assert payload["policy"] == (
@@ -3071,6 +3090,7 @@ def test_structured_logging_contract_contains_required_audit_fields(
             "volume": 1000.0, "volume_ma5": 900.0,
             "volume_ma20": 800.0, "volume_ratio": 1.25,
             "boll_width": 0.2, "boll_mid_slope": 0.1,
+            "cci14": -95.0,
         },
     })
     decision = strategy.build_resonance_decision(
@@ -3172,7 +3192,8 @@ def test_initialize_emits_version_and_separate_configuration_fingerprints(
     payload = json.loads(messages[-1])
     assert payload["event"] == "strategy_initialized"
     assert payload["version"] == strategy.STRATEGY_VERSION
-    assert payload["build"] == "20260904.2"
+    assert payload["build"] == "20260904.6"
+    assert payload["cci_observation_period"] == 14
     assert payload["atr_exit_policy"] == "OBSERVE_ONLY"
     assert payload["relative_buy_policy"] == "EMPTY_SLOT_BACKFILL"
     assert payload["relative_buy_priority_policy"] == "DMI_NEGATIVE_FIRST"
@@ -3805,8 +3826,8 @@ def _event_diagnostic_frame(previous_overrides=None, current_overrides=None):
     )
 
 
-def test_hard_boll_relative_buy_observe_only_candidate_build_id_is_20260904_2():
-    assert strategy.DEPLOYMENT_BUILD_ID == "20260904.2"
+def test_cci_observation_candidate_build_id_is_20260904_6():
+    assert strategy.DEPLOYMENT_BUILD_ID == "20260904.6"
 
 
 def test_relative_observation_build_and_formal_fingerprints_are_separated(
@@ -3818,8 +3839,9 @@ def test_relative_observation_build_and_formal_fingerprints_are_separated(
     strategy.initialize(types.SimpleNamespace())
 
     payload = json.loads(messages[-1])
-    assert strategy.DEPLOYMENT_BUILD_ID == "20260904.2"
-    assert payload["build"] == "20260904.2"
+    assert strategy.DEPLOYMENT_BUILD_ID == "20260904.6"
+    assert payload["build"] == "20260904.6"
+    assert payload["cci_observation_period"] == 14
     assert payload["atr_exit_policy"] == "OBSERVE_ONLY"
     assert payload["relative_buy_policy"] == "EMPTY_SLOT_BACKFILL"
     assert payload["relative_buy_priority_policy"] == "DMI_NEGATIVE_FIRST"
